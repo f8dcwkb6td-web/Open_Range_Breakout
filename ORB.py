@@ -726,10 +726,14 @@ def process_symbol(canon, broker_sym, sym_st, params, balance, today):
             or_size  = or_high_val - or_low_val
             sl_dist  = max(params["sl_range_mult"] * or_size, atr_val * 0.05)
 
-            sym_st["state"]           = STATE_PENDING_ENTRY
-            sym_st["pending_dir"]     = direction
-            sym_st["pending_sl_dist"] = sl_dist
-            sym_st["pending_atr"]     = atr_val
+            sym_st["state"]             = STATE_PENDING_ENTRY
+            sym_st["pending_dir"]       = direction
+            sym_st["pending_sl_dist"]   = sl_dist
+            sym_st["pending_atr"]       = atr_val
+            # FIX: claim the daily slot and start cooldown at signal time,
+            # not at fill time — matches backtest detect_signals loop exactly
+            sym_st["bars_since_last"]   = 0
+            sym_st["day_trades_count"] += 1
 
             logger.info(
                 f"[{canon}] SIGNAL {direction.upper()} "
@@ -800,21 +804,21 @@ def _execute_entry(canon, broker_sym, sym_st, params, balance, today):
         actual_ep = ep
         actual_sl = sl_price
 
-    sym_st["state"]             = STATE_IN_POSITION
-    sym_st["ticket"]            = ticket
-    sym_st["direction"]         = direction
-    sym_st["entry_price"]       = actual_ep
-    sym_st["sl_dist"]           = sl_dist
-    sym_st["be_active"]         = False
-    sym_st["current_sl"]        = actual_sl
-    sym_st["hold_count"]        = 0
-    sym_st["entry_date"]        = today
-    sym_st["entry_atr"]         = atr_e
-    sym_st["day_trades_date"]   = today
-    sym_st["day_trades_count"] += 1
-    sym_st["pending_dir"]       = None
-    sym_st["pending_sl_dist"]   = None
-    sym_st["pending_atr"]       = None
+    sym_st["state"]           = STATE_IN_POSITION
+    sym_st["ticket"]          = ticket
+    sym_st["direction"]       = direction
+    sym_st["entry_price"]     = actual_ep
+    sym_st["sl_dist"]         = sl_dist
+    sym_st["be_active"]       = False
+    sym_st["current_sl"]      = actual_sl
+    sym_st["hold_count"]      = 0
+    sym_st["entry_date"]      = today
+    sym_st["entry_atr"]       = atr_e
+    sym_st["day_trades_date"] = today
+    # NOTE: day_trades_count already incremented at signal time — do NOT touch it here
+    sym_st["pending_dir"]     = None
+    sym_st["pending_sl_dist"] = None
+    sym_st["pending_atr"]     = None
 
     logger.info(
         f"[{canon}] ENTERED {direction.upper()} "
