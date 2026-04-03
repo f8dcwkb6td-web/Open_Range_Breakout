@@ -1,38 +1,6 @@
 """
 ==============================================================================
-ORB  —  OPENING RANGE BREAKOUT  |  LIVE ENGINE v2  (M5)
-==============================================================================
-SYMBOLS:  US30, US500, UK100, GER40
-
-KEY FIX vs v1:
-  ✓ PENDING_ENTRY eliminated entirely.
-    Backtest: 12:15 bar closes -> signal -> entry at o[si+1] = 12:15 open
-              (instantaneous in simulation, same timestamp)
-    Live v1:  12:15 bar closes -> signal -> PENDING -> wait -> 12:20 open
-              = 1 full bar late every trade
-    Live v2:  12:15 bar closes -> signal -> market order NOW
-              fills at ~12:15 market price = matches backtest
-
-  ✓ TWO param sets hardcoded — set ACTIVE_PARAMS below to switch:
-      "NEW" = latest backtest output (all trail=0.75, GER40 or=30min)
-      "OLD" = what old live engine had (US30 trail=1.00, GER40 or=15min)
-
-  ✓ OR logging fixed: logs actual or_high/or_low from compute_or at
-    signal bar, not from stale state
-
-PARITY vs backtest:
-  ✓ atr_wilder, expanding_pct_rank, build_cache, compute_or  — exact copy
-  ✓ Signal: atr_pct>=0.30, in_session, ~isnan(or_high),
-            c>or_high/c<or_low, min_break_atr, cooldown, max_trades_day
-  ✓ SL dist: max(sl_range_mult*or_size, atr14[si]*0.05)
-  ✓ BE / trail / EOD / max_hold — exact port
-  ✓ OR_BARS: {15:3, 30:6, 60:12}
-  ✓ SESSION: exact UTC times
-  ✓ RISK_PER_TRADE: 0.01
-
-MAGIC:   202603261
-COMMENT: "ORB_V2"
-LOG:     orb_live_v2.log
+ORB  —  OPENING RANGE BREAKOUT  |  LIVE ENGINE v2  (M5)  — DEBUG BUILD
 ==============================================================================
 """
 
@@ -51,16 +19,18 @@ except ImportError:
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logger = logging.getLogger("ORB_V2")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)          # DEBUG level to catch everything
 _fh = RotatingFileHandler(
     "orb_live_v2.log", maxBytes=15_000_000, backupCount=5, encoding="utf-8"
 )
 _fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+_fh.setLevel(logging.DEBUG)
 logger.addHandler(_fh)
 _sh = logging.StreamHandler(
     io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 )
 _sh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+_sh.setLevel(logging.DEBUG)
 logger.addHandler(_sh)
 
 # ── MT5 connection ────────────────────────────────────────────────────────────
@@ -71,11 +41,9 @@ LOGIN    = int(os.environ.get("MT5_LOGIN",    0))
 PASSWORD =     os.environ.get("MT5_PASSWORD", "")
 SERVER   =     os.environ.get("MT5_SERVER",   "")
 
-# ── Engine identity ───────────────────────────────────────────────────────────
 MAGIC   = 202603261
 COMMENT = "ORB_V2"
 
-# ── Strategy constants ────────────────────────────────────────────────────────
 RISK_PER_TRADE = 0.01
 MAX_HOLD       = 48
 ATR_PERIOD     = 14
@@ -83,7 +51,6 @@ ATR_PCT_THRESH = 0.30
 WARMUP_M5      = 200
 
 FETCH_BARS_M5 = 2500
-FETCH_BARS_H1 = 500
 
 OR_BARS = {15: 3, 30: 6, 60: 12}
 
@@ -94,10 +61,7 @@ SESSION = {
     "GER40": {"open_h":  8, "open_m":  0, "close_h": 17},
 }
 
-# ── TWO PARAM SETS — switch here ──────────────────────────────────────────────
-# "NEW" = latest backtest results
-# "OLD" = what old live engine had hardcoded
-ACTIVE_PARAMS = "OLD"   # <--- CHANGE THIS TO COMPARE
+ACTIVE_PARAMS = "OLD"
 
 PARAMS_NEW = {
     "US30":  {"or_minutes": 15, "sl_range_mult": 0.5, "trail_atr_mult": 0.75,
@@ -123,7 +87,6 @@ PARAMS_OLD = {
 
 BEST_PARAMS = PARAMS_NEW if ACTIVE_PARAMS == "NEW" else PARAMS_OLD
 
-# ── Symbol aliases ────────────────────────────────────────────────────────────
 SYMBOL_ALIASES = {
     "US30":  ["US30", "DJ30", "DJIA", "WS30", "DOW30", "US30Cash"],
     "US500": ["US500", "SPX500", "SP500", "SPX", "US500Cash"],
@@ -133,8 +96,6 @@ SYMBOL_ALIASES = {
 
 SYMBOLS = list(BEST_PARAMS.keys())
 
-# ── State constants ───────────────────────────────────────────────────────────
-# PENDING_ENTRY removed — only two states now
 STATE_FLAT        = "FLAT"
 STATE_IN_POSITION = "IN_POSITION"
 
@@ -179,7 +140,7 @@ def build_symbol_map():
 
 
 # ==============================================================================
-#  SECTION 2 — INDICATORS  (exact copy from backtest)
+#  SECTION 2 — INDICATORS
 # ==============================================================================
 
 def atr_wilder(h, l, c):
@@ -216,7 +177,7 @@ def expanding_pct_rank(arr):
 
 
 # ==============================================================================
-#  SECTION 3 — BUILD CACHE  (exact copy from backtest)
+#  SECTION 3 — BUILD CACHE
 # ==============================================================================
 
 def build_cache(canonical, m5):
@@ -246,6 +207,7 @@ def build_cache(canonical, m5):
         "atr14":       atr14,
         "atr_pct":     atr_pct,
         "utc_h":       utc_h,
+        "utc_m":       utc_m,
         "dates":       dates,
         "times":       times,
         "in_session":  in_session,
@@ -255,7 +217,7 @@ def build_cache(canonical, m5):
 
 
 # ==============================================================================
-#  SECTION 4 — COMPUTE OR  (exact copy from backtest)
+#  SECTION 4 — COMPUTE OR
 # ==============================================================================
 
 def compute_or(cache, or_bars):
@@ -263,6 +225,7 @@ def compute_or(cache, or_bars):
     h, l    = cache["h"], cache["l"]
     dates   = cache["dates"]
     is_open = cache["is_open_bar"]
+    canon   = cache["sym"]
 
     day_start = {}
     for i in range(n):
@@ -289,6 +252,27 @@ def compute_or(cache, or_bars):
             continue
         or_high[i], or_low[i] = day_or[d]
 
+    # DEBUG: log last bar's OR state and today's day_start/day_or coverage
+    i_last = n - 1
+    last_date = dates[i_last]
+    logger.debug(
+        f"[{canon}] compute_or({or_bars}bars): "
+        f"total day_start={len(day_start)} day_or={len(day_or)} "
+        f"last_date={last_date} "
+        f"last_date_in_day_start={last_date in day_start} "
+        f"last_date_in_day_or={last_date in day_or} "
+        f"or_high[last]={or_high[i_last]} or_low[last]={or_low[i_last]}"
+    )
+    if last_date in day_start:
+        si = day_start[last_date]
+        logger.debug(
+            f"[{canon}] today day_start[{last_date}]=bar#{si} "
+            f"time={cache['times'][si]} "
+            f"utc={cache['utc_h'][si]:02d}:{cache['utc_m'][si]:02d} "
+            f"need i>={si+or_bars} current_i={i_last} "
+            f"past_or_window={i_last >= si+or_bars}"
+        )
+
     return or_high, or_low
 
 
@@ -297,58 +281,122 @@ def compute_or(cache, or_bars):
 # ==============================================================================
 
 def detect_signal_last_bar(cache, params, bars_since_last, day_trades_today):
-    """
-    Check last closed bar (i = n-1).
-    Returns (direction, or_high_val, or_low_val, atr_val, or_size, sl_dist)
-         or (None, None, None, None, None, None)
-    """
+    canon   = cache["sym"]
     or_bars = OR_BARS[params["or_minutes"]]
     or_high, or_low = compute_or(cache, or_bars)
 
     i = cache["n"] - 1
 
+    # ── DEBUG: log every filter result on the last bar ──────────────────────
+    atr_pct_val  = cache["atr_pct"][i]
+    in_sess      = cache["in_session"][i]
+    or_high_val  = or_high[i]
+    or_low_val   = or_low[i]
+    atr14_val    = cache["atr14"][i]
+    c_cur        = cache["c"][i]
+    o_cur        = cache["o"][i]
+    body         = abs(c_cur - o_cur)
+    utc_h        = cache["utc_h"][i]
+    utc_m        = cache["utc_m"][i]
+    last_time    = cache["times"][i]
+    cfg          = cache["cfg"]
+
+    logger.debug(
+        f"[{canon}] detect_signal bar#{i} "
+        f"time={last_time} "
+        f"utc={utc_h:02d}:{utc_m:02d} "
+        f"date={cache['dates'][i]} "
+        f"c={c_cur:.5f} o={o_cur:.5f} body={body:.5f}"
+    )
+    logger.debug(
+        f"[{canon}]   filters: "
+        f"warmup_ok={i >= WARMUP_M5} "
+        f"atr_pct={atr_pct_val:.4f}(need>={ATR_PCT_THRESH}) "
+        f"atr_pct_ok={not np.isnan(atr_pct_val) and atr_pct_val >= ATR_PCT_THRESH} "
+        f"in_session={in_sess} "
+        f"or_high={'NaN' if np.isnan(or_high_val) else f'{or_high_val:.5f}'} "
+        f"or_low={'NaN' if np.isnan(or_low_val) else f'{or_low_val:.5f}'} "
+        f"or_valid={not np.isnan(or_high_val)} "
+        f"cooldown={bars_since_last}>={params['cooldown_bars']}={bars_since_last >= params['cooldown_bars']} "
+        f"day_trades={day_trades_today}<{params['max_trades_day']}={day_trades_today < params['max_trades_day']}"
+    )
+
+    # session window detail
+    logger.debug(
+        f"[{canon}]   session_cfg: open={cfg['open_h']:02d}:{cfg['open_m']:02d} "
+        f"close={cfg['close_h']:02d}:00 "
+        f"in_session_calc: "
+        f"(utc_h>{cfg['open_h']} or (utc_h=={cfg['open_h']} and utc_m>={cfg['open_m']})) "
+        f"= ({utc_h}>{cfg['open_h']} or ({utc_h}=={cfg['open_h']} and {utc_m}>={cfg['open_m']})) "
+        f"= {utc_h > cfg['open_h'] or (utc_h == cfg['open_h'] and utc_m >= cfg['open_m'])} "
+        f"AND utc_h<close: {utc_h}<{cfg['close_h']}={utc_h < cfg['close_h']}"
+    )
+
+    # ── Actual filter chain ──────────────────────────────────────────────────
     if i < WARMUP_M5:
+        logger.debug(f"[{canon}]   REJECTED: warmup (i={i} < {WARMUP_M5})")
         return None, None, None, None, None, None
 
-    if np.isnan(cache["atr_pct"][i]) or cache["atr_pct"][i] < ATR_PCT_THRESH:
+    if np.isnan(atr_pct_val) or atr_pct_val < ATR_PCT_THRESH:
+        logger.debug(f"[{canon}]   REJECTED: atr_pct={atr_pct_val:.4f} < {ATR_PCT_THRESH}")
         return None, None, None, None, None, None
 
-    if not cache["in_session"][i]:
+    if not in_sess:
+        logger.debug(f"[{canon}]   REJECTED: not in_session")
         return None, None, None, None, None, None
 
-    if np.isnan(or_high[i]) or np.isnan(or_low[i]):
+    if np.isnan(or_high_val) or np.isnan(or_low_val):
+        logger.debug(f"[{canon}]   REJECTED: OR is NaN")
         return None, None, None, None, None, None
 
     if bars_since_last < params["cooldown_bars"]:
+        logger.debug(
+            f"[{canon}]   REJECTED: cooldown "
+            f"bars_since_last={bars_since_last} < {params['cooldown_bars']}"
+        )
         return None, None, None, None, None, None
 
     if day_trades_today >= params["max_trades_day"]:
+        logger.debug(
+            f"[{canon}]   REJECTED: daily cap "
+            f"day_trades={day_trades_today} >= {params['max_trades_day']}"
+        )
         return None, None, None, None, None, None
 
-    atr_val = cache["atr14"][i]
-    if np.isnan(atr_val) or atr_val <= 0:
+    if np.isnan(atr14_val) or atr14_val <= 0:
+        logger.debug(f"[{canon}]   REJECTED: atr14={atr14_val}")
         return None, None, None, None, None, None
 
-    c_cur = cache["c"][i]
-    o_cur = cache["o"][i]
-    body  = abs(c_cur - o_cur)
+    breaks_up   = c_cur > or_high_val
+    breaks_down = c_cur < or_low_val
 
-    breaks_up   = c_cur > or_high[i]
-    breaks_down = c_cur < or_low[i]
+    logger.debug(
+        f"[{canon}]   break_check: "
+        f"c={c_cur:.5f} or_high={or_high_val:.5f} or_low={or_low_val:.5f} "
+        f"breaks_up={breaks_up} breaks_down={breaks_down}"
+    )
 
     if params["min_break_atr"] > 0:
-        strong      = body >= params["min_break_atr"] * atr_val
+        strong      = body >= params["min_break_atr"] * atr14_val
+        logger.debug(
+            f"[{canon}]   min_break_atr filter: "
+            f"body={body:.5f} >= {params['min_break_atr']}*atr={params['min_break_atr']*atr14_val:.5f} "
+            f"strong={strong}"
+        )
         breaks_up   = breaks_up   and strong
         breaks_down = breaks_down and strong
 
-    or_size = or_high[i] - or_low[i]
-    sl_dist = max(params["sl_range_mult"] * or_size, atr_val * 0.05)
+    or_size = or_high_val - or_low_val
+    sl_dist = max(params["sl_range_mult"] * or_size, atr14_val * 0.05)
 
     if breaks_up and not breaks_down:
-        return "long",  or_high[i], or_low[i], atr_val, or_size, sl_dist
+        logger.debug(f"[{canon}]   SIGNAL: LONG")
+        return "long",  or_high_val, or_low_val, atr14_val, or_size, sl_dist
     if breaks_down and not breaks_up:
-        return "short", or_high[i], or_low[i], atr_val, or_size, sl_dist
+        logger.debug(f"[{canon}]   SIGNAL: SHORT")
+        return "short", or_high_val, or_low_val, atr14_val, or_size, sl_dist
 
+    logger.debug(f"[{canon}]   NO SIGNAL: no break (or both sides broke simultaneously)")
     return None, None, None, None, None, None
 
 
@@ -373,21 +421,12 @@ def fetch_m5(broker_sym, n=FETCH_BARS_M5):
     df["utc_hour"]   = df["time_utc"].dt.hour
     df["utc_minute"] = df["time_utc"].dt.minute
     df["date"]       = df["time_utc"].dt.date
-    # Drop the still-forming bar
-    return df.iloc[:-1].reset_index(drop=True)
-
-
-def fetch_h1(broker_sym, n=FETCH_BARS_H1):
-    rates = mt5.copy_rates_from_pos(broker_sym, mt5.TIMEFRAME_H1, 0, n + 1)
-    if rates is None or len(rates) < 10:
-        return None
-    cols = ["time", "open", "high", "low", "close",
-            "tick_volume", "spread", "real_volume"]
-    df = pd.DataFrame(rates, columns=cols)[
-        ["time", "open", "high", "low", "close"]
-    ].copy()
-    df["time_utc"] = pd.to_datetime(df["time"].astype(np.int64), unit="s")
-    return df.iloc[:-1].reset_index(drop=True)
+    df = df.iloc[:-1].reset_index(drop=True)   # drop still-forming bar
+    logger.debug(
+        f"[{broker_sym}] fetch_m5: {len(df)} bars "
+        f"{df['time_utc'].iloc[0]} -> {df['time_utc'].iloc[-1]}"
+    )
+    return df
 
 
 # ==============================================================================
@@ -529,7 +568,6 @@ def send_close_order(broker_sym, position):
 def make_symbol_state():
     return {
         "state":            STATE_FLAT,
-        # In-position fields
         "ticket":           None,
         "direction":        None,
         "entry_price":      None,
@@ -539,7 +577,6 @@ def make_symbol_state():
         "hold_count":       0,
         "entry_date":       None,
         "entry_atr":        None,
-        # Cooldown / daily cap
         "bars_since_last":  9999,
         "day_trades_date":  None,
         "day_trades_count": 0,
@@ -547,7 +584,6 @@ def make_symbol_state():
 
 
 def _reset_after_close(sym_st, today):
-    """Wipe position fields, preserve daily accounting and cooldown."""
     day_trades_date  = sym_st["day_trades_date"]
     day_trades_count = sym_st["day_trades_count"]
     bars_since_last  = sym_st["bars_since_last"]
@@ -570,6 +606,10 @@ def _reset_after_close(sym_st, today):
 
 def _reset_daily_counter(sym_st, today):
     if sym_st["day_trades_date"] != today:
+        logger.debug(
+            f"  daily counter reset: {sym_st['day_trades_date']} -> {today} "
+            f"(was {sym_st['day_trades_count']} trades)"
+        )
         sym_st["day_trades_date"]  = today
         sym_st["day_trades_count"] = 0
 
@@ -618,16 +658,8 @@ def reconstruct_position_state(canon, position):
 # ==============================================================================
 
 def process_symbol(canon, broker_sym, sym_st, params, balance, today):
-    """
-    Called once per closed M5 bar.
-
-    Flow (PENDING_ENTRY removed):
-      FLAT:         detect signal -> if found, place market order NOW
-      IN_POSITION:  manage (EOD / max-hold / BE / trail)
-    """
     # 1. Fetch
     df_m5 = fetch_m5(broker_sym)
-    _      = fetch_h1(broker_sym)
     if df_m5 is None:
         logger.warning(f"[{canon}] M5 fetch failed — skipping bar")
         return
@@ -647,6 +679,14 @@ def process_symbol(canon, broker_sym, sym_st, params, balance, today):
 
     broker_has_pos = len(positions) > 0
     state_in_pos   = sym_st["state"] == STATE_IN_POSITION
+
+    logger.debug(
+        f"[{canon}] state={sym_st['state']} "
+        f"broker_has_pos={broker_has_pos} "
+        f"bars_since_last={sym_st['bars_since_last']} "
+        f"day_trades={sym_st['day_trades_count']} "
+        f"today={today} day_trades_date={sym_st['day_trades_date']}"
+    )
 
     if broker_has_pos and not state_in_pos:
         logger.warning(
@@ -668,7 +708,7 @@ def process_symbol(canon, broker_sym, sym_st, params, balance, today):
                          positions, today)
         return
 
-    # 7. FLAT -> detect signal -> enter immediately if found
+    # 7. FLAT -> detect signal
     if sym_st["state"] == STATE_FLAT:
         direction, or_high_val, or_low_val, atr_val, or_size, sl_dist = \
             detect_signal_last_bar(
@@ -680,7 +720,6 @@ def process_symbol(canon, broker_sym, sym_st, params, balance, today):
         if direction is None:
             return
 
-        # Log the signal with correct OR values from compute_or
         logger.info(
             f"[{canon}] SIGNAL {direction.upper()} "
             f"or_high={or_high_val:.5f} or_low={or_low_val:.5f} "
@@ -691,21 +730,15 @@ def process_symbol(canon, broker_sym, sym_st, params, balance, today):
             f"bars_since_last={sym_st['bars_since_last']})"
         )
 
-        # Claim cooldown and daily slot
         sym_st["bars_since_last"]  = 0
         sym_st["day_trades_count"] += 1
 
-        # Place market order IMMEDIATELY — no pending state
         _execute_entry(canon, broker_sym, sym_st, params,
                        balance, today, direction, sl_dist, atr_val)
 
 
 def _execute_entry(canon, broker_sym, sym_st, params,
                    balance, today, direction, sl_dist, atr_val):
-    """
-    Place market order immediately on signal bar close.
-    Fills at current market price (~next bar open = backtest o[si+1]).
-    """
     tick = mt5.symbol_info_tick(broker_sym)
     if tick is None:
         logger.error(f"[{canon}] Tick unavailable — entry cancelled")
@@ -738,7 +771,6 @@ def _execute_entry(canon, broker_sym, sym_st, params,
         logger.error(f"[{canon}] Order failed — entry cancelled")
         return
 
-    # Confirm fill
     time.sleep(0.5)
     filled = [p for p in (mt5.positions_get(symbol=broker_sym) or [])
               if p.magic == MAGIC and p.ticket == ticket]
@@ -772,7 +804,6 @@ def _execute_entry(canon, broker_sym, sym_st, params,
 
 
 def _manage_position(canon, broker_sym, sym_st, params, cache, positions, today):
-    """Manage open position — exact port of backtest inner loop."""
     i         = cache["n"] - 1
     direction = sym_st["direction"]
     ep        = sym_st["entry_price"]
@@ -786,8 +817,15 @@ def _manage_position(canon, broker_sym, sym_st, params, cache, positions, today)
     hc  = sym_st["hold_count"]
     pos = positions[0] if positions else None
 
-    # EOD exit
     current_utc_hour = datetime.datetime.utcnow().hour
+    logger.debug(
+        f"[{canon}] manage: hold={hc}/{MAX_HOLD} "
+        f"entry_date={sym_st['entry_date']} today={today} "
+        f"utc_hour={current_utc_hour} close_h={cfg['close_h']} "
+        f"be={sym_st['be_active']} cur_sl={sym_st['current_sl']:.5f}"
+    )
+
+    # EOD exit
     if sym_st["entry_date"] != today or current_utc_hour >= cfg["close_h"]:
         logger.info(
             f"[{canon}] EOD exit "
@@ -834,7 +872,7 @@ def _manage_position(canon, broker_sym, sym_st, params, cache, positions, today)
             sym_st["current_sl"] = min(sym_st["current_sl"],
                                        bar_l + trail_mult * ta)
 
-    # Update broker SL if moved by >= 1 pip
+    # Update broker SL
     if pos is not None:
         broker_sl = pos.sl or 0.0
         new_sl    = sym_st["current_sl"]
@@ -971,7 +1009,6 @@ def run_live():
         broker = sym_map[canon]
         info   = mt5.symbol_info(broker)
         tick   = mt5.symbol_info_tick(broker)
-        bars_t = mt5.copy_rates_from_pos(broker, mt5.TIMEFRAME_M5, 0, 5)
         tvpl   = (info.trade_tick_value / info.trade_tick_size
                   if info and info.trade_tick_size > 0 else "N/A")
         logger.info(
@@ -991,7 +1028,6 @@ def run_live():
 
     sym_states = {canon: make_symbol_state() for canon in active_symbols}
 
-    # Startup recovery
     logger.info("=== STARTUP RECOVERY ===")
     for canon in active_symbols:
         broker    = sym_map[canon]
