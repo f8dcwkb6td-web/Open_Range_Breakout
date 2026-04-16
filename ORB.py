@@ -20,6 +20,14 @@ KEY FIX vs v1:
   ✓ OR logging fixed: logs actual or_high/or_low from compute_or at
     signal bar, not from stale state
 
+  ✓ RISK GUARD (v2 patch):
+      After lot sizing, actual monetary risk is computed as:
+          actual_risk = lot * sl_dist * (tick_value / tick_size)
+      If actual_risk > MAX_RISK_MULTIPLIER (3×) * intended_risk the trade
+      is REJECTED and both figures are logged.  This catches the case where
+      vol_min (e.g. 0.1) forces a lot that blows through the 1% target.
+      Every accepted entry also logs intended vs actual risk %.
+
 PARITY vs backtest:
   ✓ atr_wilder, expanding_pct_rank, build_cache, compute_or  — exact copy
   ✓ Signal: atr_pct>=0.30, in_session, ~isnan(or_high),
@@ -76,11 +84,12 @@ MAGIC   = 202603261
 COMMENT = "ORB_V2"
 
 # ── Strategy constants ────────────────────────────────────────────────────────
-RISK_PER_TRADE = 0.01
-MAX_HOLD       = 48
-ATR_PERIOD     = 14
-ATR_PCT_THRESH = 0.30
-WARMUP_M5      = 200
+RISK_PER_TRADE     = 0.01
+MAX_RISK_MULTIPLIER = 3.0   # reject if actual risk > 3× intended (vol_min floor)
+MAX_HOLD           = 48
+ATR_PERIOD         = 14
+ATR_PCT_THRESH     = 0.30
+WARMUP_M5          = 200
 
 FETCH_BARS_M5 = 2500
 FETCH_BARS_H1 = 500
@@ -95,8 +104,6 @@ SESSION = {
 }
 
 # ── TWO PARAM SETS — switch here ──────────────────────────────────────────────
-# "NEW" = latest backtest results
-# "OLD" = what old live engine had hardcoded
 ACTIVE_PARAMS = "OLD"   # <--- CHANGE THIS TO COMPARE
 
 PARAMS_NEW = {
@@ -134,7 +141,6 @@ SYMBOL_ALIASES = {
 SYMBOLS = list(BEST_PARAMS.keys())
 
 # ── State constants ───────────────────────────────────────────────────────────
-# PENDING_ENTRY removed — only two states now
 STATE_FLAT        = "FLAT"
 STATE_IN_POSITION = "IN_POSITION"
 
@@ -373,7 +379,6 @@ def fetch_m5(broker_sym, n=FETCH_BARS_M5):
     df["utc_hour"]   = df["time_utc"].dt.hour
     df["utc_minute"] = df["time_utc"].dt.minute
     df["date"]       = df["time_utc"].dt.date
-    # Drop the still-forming bar
     return df.iloc[:-1].reset_index(drop=True)
 
 
@@ -391,27 +396,38 @@ def fetch_h1(broker_sym, n=FETCH_BARS_H1):
 
 
 # ==============================================================================
-#  SECTION 7 — POSITION SIZING
+#  SECTION 7 — POSITION SIZING  (with risk guard)
 # ==============================================================================
 
 def compute_lot_size(broker_sym, entry_price, sl_price, balance):
+    """
+    Calculates lot size targeting RISK_PER_TRADE of balance.
+
+    Returns (lot, intended_risk_amount, actual_risk_amount) on success,
+    or (None, None, None) on failure / risk-guard rejection.
+
+    Risk guard: if vol_min forces actual_risk > MAX_RISK_MULTIPLIER *
+    intended_risk the trade is rejected and the discrepancy is logged.
+    This is the primary protection against wide-SL + large vol_min blowing
+    through the 1% target.
+    """
     info = mt5.symbol_info(broker_sym)
     if info is None:
         logger.error(f"[{broker_sym}] symbol_info returned None")
-        return None
+        return None, None, None
 
     sl_dist = abs(entry_price - sl_price)
     if sl_dist < 1e-9:
         logger.error(f"[{broker_sym}] SL distance is zero")
-        return None
+        return None, None, None
 
     if info.trade_tick_size <= 0:
         logger.error(f"[{broker_sym}] trade_tick_size <= 0")
-        return None
+        return None, None, None
 
     tick_value_per_lot = info.trade_tick_value / info.trade_tick_size
-    risk_amount        = balance * RISK_PER_TRADE
-    raw_lot            = risk_amount / (sl_dist * tick_value_per_lot)
+    intended_risk      = balance * RISK_PER_TRADE
+    raw_lot            = intended_risk / (sl_dist * tick_value_per_lot)
 
     step    = info.volume_step if info.volume_step > 0 else 0.01
     vol_min = info.volume_min  if info.volume_min  > 0 else 0.01
@@ -420,13 +436,32 @@ def compute_lot_size(broker_sym, entry_price, sl_price, balance):
     lot = max(vol_min, min(vol_max, round(raw_lot / step) * step))
     lot = round(lot, 8)
 
+    # ── Risk guard ────────────────────────────────────────────────────────────
+    # Compute what this lot will actually lose if SL is hit.
+    actual_risk = lot * sl_dist * tick_value_per_lot
+    intended_pct = intended_risk / balance * 100.0   # should equal RISK_PER_TRADE*100
+    actual_pct   = actual_risk   / balance * 100.0
+
     logger.info(
         f"[{broker_sym}] lot_calc: balance={balance:.2f} "
-        f"risk={risk_amount:.2f} sl_dist={sl_dist:.5f} "
-        f"tick_val/lot={tick_value_per_lot:.5f} "
-        f"raw={raw_lot:.4f} -> lot={lot}"
+        f"sl_dist={sl_dist:.5f} tick_val/lot={tick_value_per_lot:.5f} "
+        f"raw_lot={raw_lot:.4f} vol_min={vol_min} -> lot={lot} | "
+        f"intended_risk={intended_risk:.2f} ({intended_pct:.3f}%) "
+        f"actual_risk={actual_risk:.2f} ({actual_pct:.3f}%)"
     )
-    return lot
+
+    if actual_risk > MAX_RISK_MULTIPLIER * intended_risk:
+        logger.warning(
+            f"[{broker_sym}] RISK GUARD REJECTED — "
+            f"actual_risk={actual_risk:.2f} ({actual_pct:.3f}%) exceeds "
+            f"{MAX_RISK_MULTIPLIER:.1f}x intended_risk={intended_risk:.2f} "
+            f"({intended_pct:.3f}%). "
+            f"Cause: vol_min={vol_min} forces lot={lot} "
+            f"when ideal lot={raw_lot:.4f}. Trade skipped."
+        )
+        return None, intended_risk, actual_risk
+
+    return lot, intended_risk, actual_risk
 
 
 # ==============================================================================
@@ -691,7 +726,9 @@ def process_symbol(canon, broker_sym, sym_st, params, balance, today):
             f"bars_since_last={sym_st['bars_since_last']})"
         )
 
-        # Claim cooldown and daily slot
+        # Claim cooldown and daily slot BEFORE entry attempt.
+        # Slots are not returned on risk-guard rejection to prevent
+        # repeated attempts on the same wide-SL condition.
         sym_st["bars_since_last"]  = 0
         sym_st["day_trades_count"] += 1
 
@@ -705,6 +742,10 @@ def _execute_entry(canon, broker_sym, sym_st, params,
     """
     Place market order immediately on signal bar close.
     Fills at current market price (~next bar open = backtest o[si+1]).
+
+    The lot-size / risk-guard check happens here via compute_lot_size.
+    If actual_risk > MAX_RISK_MULTIPLIER * intended_risk the trade is
+    aborted and both figures are logged — no order is sent.
     """
     tick = mt5.symbol_info_tick(broker_sym)
     if tick is None:
@@ -726,9 +767,29 @@ def _execute_entry(canon, broker_sym, sym_st, params,
         sl_price = ep + min_sl_dist
         sl_dist  = min_sl_dist
 
-    lot = compute_lot_size(broker_sym, ep, sl_price, balance)
+    # ── Lot sizing with risk guard ────────────────────────────────────────────
+    lot, intended_risk, actual_risk = compute_lot_size(
+        broker_sym, ep, sl_price, balance
+    )
+
     if lot is None:
-        logger.error(f"[{canon}] Lot calc failed — entry cancelled")
+        # compute_lot_size already logged the reason (risk guard or data error).
+        # If it was a risk-guard rejection, intended_risk and actual_risk are
+        # set so we can emit a dedicated RISK_GUARD log line here too.
+        if intended_risk is not None and actual_risk is not None:
+            logger.warning(
+                f"[{canon}] ENTRY ABORTED by risk guard | "
+                f"direction={direction} ep={ep:.5f} sl={sl_price:.5f} "
+                f"sl_dist={sl_dist:.5f} | "
+                f"intended={intended_risk:.2f} "
+                f"({intended_risk/balance*100:.3f}%) "
+                f"actual_if_filled={actual_risk:.2f} "
+                f"({actual_risk/balance*100:.3f}%) | "
+                f"ratio={actual_risk/intended_risk:.2f}x > "
+                f"{MAX_RISK_MULTIPLIER:.1f}x limit"
+            )
+        else:
+            logger.error(f"[{canon}] Lot calc failed — entry cancelled")
         return
 
     ticket, _ = send_market_order(
@@ -749,9 +810,22 @@ def _execute_entry(canon, broker_sym, sym_st, params,
         sl_dist   = abs(actual_ep - actual_sl)
         if sl_dist < 1e-9:
             sl_dist = min_sl_dist
+        # Recompute actual monetary risk from confirmed fill price/SL
+        info = mt5.symbol_info(broker_sym)
+        if info and info.trade_tick_size > 0:
+            tvpl        = info.trade_tick_value / info.trade_tick_size
+            actual_risk = lot * sl_dist * tvpl
     else:
         actual_ep = ep
         actual_sl = sl_price
+
+    # ── Log intended vs actual risk on every successful entry ─────────────────
+    logger.info(
+        f"[{canon}] RISK SUMMARY | "
+        f"intended={intended_risk:.2f} ({intended_risk/balance*100:.3f}%) "
+        f"actual={actual_risk:.2f} ({actual_risk/balance*100:.3f}%) "
+        f"ratio={actual_risk/intended_risk:.2f}x"
+    )
 
     sym_st["state"]        = STATE_IN_POSITION
     sym_st["ticket"]       = ticket
@@ -1017,7 +1091,8 @@ def run_live():
         logger.info(f"  {canon}: {BEST_PARAMS[canon]}")
     logger.info(
         f"  RISK={RISK_PER_TRADE:.2%}  MAX_HOLD={MAX_HOLD}bars  "
-        f"ATR_PCT_THRESH={ATR_PCT_THRESH}  WARMUP={WARMUP_M5}bars"
+        f"ATR_PCT_THRESH={ATR_PCT_THRESH}  WARMUP={WARMUP_M5}bars  "
+        f"MAX_RISK_MULT={MAX_RISK_MULTIPLIER:.1f}x"
     )
     logger.info("=== END PARAMS ===")
 
