@@ -10,13 +10,47 @@ KEY FIX vs v1:
   ✓ OR logging fixed.
   ✓ [v2.1] Pre-entry risk guard: computes actual monetary loss at SL
     (lot * sl_dist * tick_value_per_lot), logs intended vs actual risk,
-    and REJECTS the trade if actual_risk > 3 * intended_risk.
+    and REJECTS the trade if actual_risk > MAX_RISK_MULTIPLE * intended_risk.
     Prevents min-lot floor silently blowing through 1% risk.
 
-PARITY vs backtest: exact copy of all indicator / signal logic.
+TIMESTAMP PARITY WITH BACKTEST (fixed in this version):
+──────────────────────────────────────────────────────────────────────────────
+  All three files (live engine, broker-like BT, chrono BT) now share
+  identical logic for every timestamp-sensitive operation:
+
+  1. TODAY DERIVATION — bar timestamp, not wall clock
+     WAS:  today = datetime.datetime.utcnow().date()   ← wall clock
+     NOW:  today = cache["dates"][-1]                  ← bar timestamp
+     WHY:  Under any processing latency, or when a bar closes right at
+           midnight, utcnow().date() can be one calendar day ahead of the
+           bar's own date.  That causes the new-day EOD check
+           (entry_date != today) to fire one bar too early, generating an
+           extra exit that the backtest never sees.  Using the bar's own UTC
+           date keeps live and BT on exactly the same calendar boundary.
+
+  2. EOD BAR-HOUR CHECK — bar timestamp hour (already correct in v2.0)
+     Uses cache["utc_h"][-1] (bar timestamp), not datetime.utcnow().hour.
+     Matches backtest: utc_h[bi] >= close_h.
+
+  3. ENTRY POINT — open of bar si+1, same as backtest
+     Live sends market order immediately on signal bar close.
+     BT enters at o[ei] where ei = si+1.
+     Both use the opening tick of the next bar — no divergence.
+
+  4. SL DISTANCE — same formula as backtest resolve_trade()
+     sl_dist = max(sl_range_mult * or_size, atr * 0.05)
+     min_sl_dist = 0.05 * atr
+     Applied identically in detect_signal_last_bar and _execute_entry.
+
+  5. TODAY PASSED AS PARAMETER → REMOVED
+     process_symbol() no longer accepts a `today` parameter.
+     It derives today internally from the bar timestamp, guaranteeing
+     every downstream function (EOD check, daily counter reset, state
+     recording) uses the same bar-derived date.
+
+LOG:     orb_live_v2.log
 MAGIC:   202603261
 COMMENT: "ORB_V2"
-LOG:     orb_live_v2.log
 ==============================================================================
 """
 
@@ -322,6 +356,12 @@ def detect_signal_last_bar(cache, params, bars_since_last, day_trades_today):
         breaks_down = breaks_down and strong
 
     or_size = or_high[i] - or_low[i]
+
+    # ── SL distance — identical formula to backtest resolve_trade() ──────────
+    # BT:   sl_dist = max(sl_range_mult * or_size, atr * 0.05)
+    #       min_sl_dist = 0.05 * atr
+    # Both clamp to min_sl_dist floor; min_sl_dist applied in _execute_entry
+    # after tick fetch (same as BT applies it after entry price is known).
     sl_dist = max(params["sl_range_mult"] * or_size, atr_val * 0.05)
 
     if breaks_up and not breaks_down:
@@ -353,6 +393,8 @@ def fetch_m5(broker_sym, n=FETCH_BARS_M5):
     df["utc_hour"]   = df["time_utc"].dt.hour
     df["utc_minute"] = df["time_utc"].dt.minute
     df["date"]       = df["time_utc"].dt.date
+    # Drop the incomplete live bar (last row) — same as BT which only looks
+    # at fully closed bars.
     return df.iloc[:-1].reset_index(drop=True)
 
 
@@ -415,15 +457,8 @@ def compute_lot_size(broker_sym, entry_price, sl_price, balance):
 def check_actual_risk(canon, broker_sym, lot, entry_price, sl_price, balance):
     """
     Compute the actual monetary loss if SL is hit, compare to intended 1% risk.
-    Logs a structured risk line in all cases.
-    Returns True  -> trade is safe to place (actual_risk <= MAX_RISK_MULTIPLE * intended)
-    Returns False -> trade must be REJECTED (would risk too much money)
-
-    Formula:
-        actual_loss = lot * sl_dist * (tick_value / tick_size)
-    This is the same calculation used in compute_lot_size, but evaluated
-    *after* the lot has been floored to vol_min, so it catches the case
-    where vol_min forces a much larger position than intended.
+    Returns True  -> trade is safe to place
+    Returns False -> trade must be REJECTED
     """
     info = mt5.symbol_info(broker_sym)
     if info is None:
@@ -445,7 +480,6 @@ def check_actual_risk(canon, broker_sym, lot, entry_price, sl_price, balance):
     actual_loss   = lot * sl_dist * tick_value_per_lot
     risk_multiple = actual_loss / intended_risk if intended_risk > 0 else float("inf")
 
-    # Always log the risk audit line
     status = "OK" if risk_multiple <= MAX_RISK_MULTIPLE else "REJECTED"
     logger.info(
         f"[{canon}] RISK_AUDIT [{status}] "
@@ -586,7 +620,12 @@ def make_symbol_state():
     }
 
 
-def _reset_after_close(sym_st, today):
+def _reset_after_close(sym_st):
+    """
+    Reset position fields after a close.  Preserves daily trade counter and
+    bars_since_last so they survive across the close correctly.
+    NOTE: today is no longer a parameter — callers must not pass it.
+    """
     day_trades_date  = sym_st["day_trades_date"]
     day_trades_count = sym_st["day_trades_count"]
     bars_since_last  = sym_st["bars_since_last"]
@@ -608,6 +647,9 @@ def _reset_after_close(sym_st, today):
 
 
 def _reset_daily_counter(sym_st, today):
+    """
+    today must be the bar-derived date (cache["dates"][-1]), not utcnow().date().
+    """
     if sym_st["day_trades_date"] != today:
         sym_st["day_trades_date"]  = today
         sym_st["day_trades_count"] = 0
@@ -656,7 +698,20 @@ def reconstruct_position_state(canon, position):
 #  SECTION 10 — PER-BAR PROCESSING
 # ==============================================================================
 
-def process_symbol(canon, broker_sym, sym_st, params, balance, today):
+def process_symbol(canon, broker_sym, sym_st, params, balance):
+    """
+    Process one bar for one symbol.
+
+    today is derived from the bar's own UTC timestamp (cache["dates"][-1]),
+    NOT from datetime.utcnow().date().
+
+    Rationale: utcnow().date() is the wall-clock calendar date at processing
+    time.  Under latency, or when a bar closes right at midnight, the wall
+    clock can be one calendar day ahead of the bar's date.  That makes the
+    new-day EOD check (entry_date != today) fire one bar too early — an exit
+    the backtest never generates.  Using the bar's own date keeps both engines
+    on the identical calendar boundary.
+    """
     df_m5 = fetch_m5(broker_sym)
     _      = fetch_h1(broker_sym)
     if df_m5 is None:
@@ -664,6 +719,11 @@ def process_symbol(canon, broker_sym, sym_st, params, balance, today):
         return
 
     cache = build_cache(canon, df_m5)
+
+    # ── KEY FIX: today from bar timestamp, not wall clock ────────────────────
+    today = cache["dates"][-1]
+    # ─────────────────────────────────────────────────────────────────────────
+
     _reset_daily_counter(sym_st, today)
     sym_st["bars_since_last"] += 1
 
@@ -684,7 +744,7 @@ def process_symbol(canon, broker_sym, sym_st, params, balance, today):
     if not broker_has_pos and state_in_pos:
         logger.info(f"[{canon}] Position closed server-side (SL hit)")
         _log_close(canon, sym_st)
-        _reset_after_close(sym_st, today)
+        _reset_after_close(sym_st)
         return
 
     if sym_st["state"] == STATE_IN_POSITION:
@@ -713,7 +773,7 @@ def process_symbol(canon, broker_sym, sym_st, params, balance, today):
             f"bars_since_last={sym_st['bars_since_last']})"
         )
 
-        # Claim cooldown / daily slot BEFORE risk guard so the counters
+        # Claim cooldown / daily slot BEFORE risk guard so counters
         # reflect truth even if the trade is ultimately rejected.
         sym_st["bars_since_last"]  = 0
         sym_st["day_trades_count"] += 1
@@ -727,12 +787,20 @@ def _execute_entry(canon, broker_sym, sym_st, params,
     """
     Place market order immediately on signal bar close.
 
+    Entry price = current ask/bid tick — the opening tick of the next bar,
+    matching the backtest which enters at o[ei] = open of bar si+1.
+
+    SL distance uses the same formula as backtest resolve_trade():
+        sl_dist = max(sl_range_mult * or_size, atr * 0.05)   [from signal detection]
+        min_sl_dist = 0.05 * atr                              [applied here]
+
     Order of operations:
-      1. Get current tick price
-      2. Finalise sl_price from tick + sl_dist
-      3. Compute lot via compute_lot_size (may be floored to vol_min)
-      4. *** check_actual_risk — REJECT if > MAX_RISK_MULTIPLE * intended ***
-      5. Send order only if risk guard passes
+      1. Get current tick price (= approximately o[next bar])
+      2. Apply min_sl_dist floor (same as BT)
+      3. Finalise sl_price
+      4. Compute lot (may be floored to vol_min)
+      5. Risk guard — REJECT if actual_risk > MAX_RISK_MULTIPLE * intended
+      6. Send order only if risk guard passes
     """
     tick = mt5.symbol_info_tick(broker_sym)
     if tick is None:
@@ -741,12 +809,14 @@ def _execute_entry(canon, broker_sym, sym_st, params,
 
     ep = tick.ask if direction == "long" else tick.bid
 
+    # ── min_sl_dist floor — mirrors backtest resolve_trade() ─────────────────
     min_sl_dist = 0.05 * atr_val
     if sl_dist < min_sl_dist:
         sl_dist = min_sl_dist
 
     sl_price = ep - sl_dist if direction == "long" else ep + sl_dist
 
+    # Edge-case guard: sl must be strictly on the correct side of entry
     if direction == "long"  and sl_price >= ep:
         sl_price = ep - min_sl_dist
         sl_dist  = min_sl_dist
@@ -760,13 +830,9 @@ def _execute_entry(canon, broker_sym, sym_st, params,
         return
 
     # ── RISK GUARD ────────────────────────────────────────────────────────────
-    # This must come AFTER lot is finalised (post vol_min floor) so we
-    # evaluate the true monetary exposure, not the raw ideal lot.
     if not check_actual_risk(canon, broker_sym, lot, ep, sl_price, balance):
-        # check_actual_risk already logged a detailed RISK_AUDIT REJECTED line.
-        # Undo the daily/cooldown slot we pre-claimed (trade never happened).
         sym_st["day_trades_count"] = max(0, sym_st["day_trades_count"] - 1)
-        sym_st["bars_since_last"]  = params["cooldown_bars"]  # restart cooldown
+        sym_st["bars_since_last"]  = params["cooldown_bars"]
         logger.warning(
             f"[{canon}] Entry aborted by risk guard — "
             f"daily trade count rolled back"
@@ -814,6 +880,18 @@ def _execute_entry(canon, broker_sym, sym_st, params,
 
 
 def _manage_position(canon, broker_sym, sym_st, params, cache, positions, today):
+    """
+    Manage an open position for one bar.
+
+    today must be the bar-derived date passed from process_symbol.
+    The EOD new-day check compares sym_st["entry_date"] against today (bar
+    date), not utcnow().date().  This is identical to the backtest check:
+        dates[bi] != entry_date
+
+    The bar-hour EOD check uses the last bar's UTC hour from the cache
+    (cache["utc_h"][-1]), not datetime.utcnow().hour — matching BT's
+    utc_h[bi] >= close_h.
+    """
     i         = cache["n"] - 1
     direction = sym_st["direction"]
     ep        = sym_st["entry_price"]
@@ -827,21 +905,19 @@ def _manage_position(canon, broker_sym, sym_st, params, cache, positions, today)
     hc  = sym_st["hold_count"]
     pos = positions[0] if positions else None
 
-    # Use the bar's own UTC hour (from M5 timestamp), NOT utcnow().
-    # utcnow() is the wall-clock processing time and diverges from bar time
-    # under latency or slow bar processing.  Bar timestamp is the ground truth
-    # and matches backtest logic exactly (utc_h[bi] >= close_h).
+    # ── EOD check — bar timestamp hour, matches backtest utc_h[bi] ──────────
+    # today is already bar-derived (passed from process_symbol).
     current_bar_hour = int(cache["utc_h"][i])
     if sym_st["entry_date"] != today or current_bar_hour >= cfg["close_h"]:
         logger.info(
             f"[{canon}] EOD exit "
-            f"(entry_date={sym_st['entry_date']} today={today} "
+            f"(entry_date={sym_st['entry_date']} bar_date={today} "
             f"bar_utc_hour={current_bar_hour} close_h={cfg['close_h']})"
         )
         if pos:
             send_close_order(broker_sym, pos)
         _log_close(canon, sym_st)
-        _reset_after_close(sym_st, today)
+        _reset_after_close(sym_st)
         return
 
     if hc >= MAX_HOLD:
@@ -849,7 +925,7 @@ def _manage_position(canon, broker_sym, sym_st, params, cache, positions, today)
         if pos:
             send_close_order(broker_sym, pos)
         _log_close(canon, sym_st)
-        _reset_after_close(sym_st, today)
+        _reset_after_close(sym_st)
         return
 
     one_r = ep + (sl_dist if direction == "long" else -sl_dist)
@@ -1074,10 +1150,15 @@ def run_live():
             new_bar_time  = wait_for_new_bar(last_bar_time)
             last_bar_time = new_bar_time
             bar_count    += 1
-            today         = datetime.datetime.utcnow().date()
+
+            # Wall-clock date used only for logging — never for EOD decisions.
+            # All EOD logic uses the bar-timestamp date derived inside
+            # process_symbol from cache["dates"][-1].
+            wall_today = datetime.datetime.utcnow().date()
 
             logger.info(
                 f"-- BAR {bar_count} | {new_bar_time} UTC "
+                f"(wall={wall_today}) "
                 f"----------------------------------------"
             )
 
@@ -1087,9 +1168,11 @@ def run_live():
                 broker = sym_map[canon]
                 params = BEST_PARAMS[canon]
                 try:
+                    # today is no longer passed in — process_symbol derives it
+                    # from the bar timestamp so it matches the backtest exactly.
                     process_symbol(
                         canon, broker, sym_states[canon],
-                        params, balance, today
+                        params, balance
                     )
                 except Exception as sym_err:
                     logger.exception(f"[{canon}] Error in process_symbol: {sym_err}")
