@@ -68,7 +68,7 @@ WARMUP_M5         = 200
 
 # Risk guard: reject if actual monetary risk at SL exceeds this multiple
 # of the intended 1% risk.  Catches min-lot floor violations.
-MAX_RISK_MULTIPLE = 2.0
+MAX_RISK_MULTIPLE = 3.0
 
 FETCH_BARS_M5 = 2500
 FETCH_BARS_H1 = 500
@@ -827,12 +827,16 @@ def _manage_position(canon, broker_sym, sym_st, params, cache, positions, today)
     hc  = sym_st["hold_count"]
     pos = positions[0] if positions else None
 
-    current_utc_hour = datetime.datetime.utcnow().hour
-    if sym_st["entry_date"] != today or current_utc_hour >= cfg["close_h"]:
+    # Use the bar's own UTC hour (from M5 timestamp), NOT utcnow().
+    # utcnow() is the wall-clock processing time and diverges from bar time
+    # under latency or slow bar processing.  Bar timestamp is the ground truth
+    # and matches backtest logic exactly (utc_h[bi] >= close_h).
+    current_bar_hour = int(cache["utc_h"][i])
+    if sym_st["entry_date"] != today or current_bar_hour >= cfg["close_h"]:
         logger.info(
             f"[{canon}] EOD exit "
             f"(entry_date={sym_st['entry_date']} today={today} "
-            f"utc_hour={current_utc_hour} close_h={cfg['close_h']})"
+            f"bar_utc_hour={current_bar_hour} close_h={cfg['close_h']})"
         )
         if pos:
             send_close_order(broker_sym, pos)
