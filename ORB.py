@@ -68,9 +68,9 @@ WARMUP_M5         = 200
 
 # Risk guard: reject if actual monetary risk at SL exceeds this multiple
 # of the intended 1% risk.  Catches min-lot floor violations.
-MAX_RISK_MULTIPLE = 3.0
+MAX_RISK_MULTIPLE = 2.0
 
-FETCH_BARS_M5 = 2500
+FETCH_BARS_M5 = 5000
 FETCH_BARS_H1 = 500
 
 OR_BARS = {15: 3, 30: 6, 60: 12}
