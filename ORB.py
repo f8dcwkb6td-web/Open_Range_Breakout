@@ -176,10 +176,6 @@ SYMBOL_ALIASES = {
 
 SYMBOLS = list(SESSION.keys())
 
-# ── State constants ───────────────────────────────────────────────────────────
-STATE_FLAT        = "FLAT"
-STATE_IN_POSITION = "IN_POSITION"
-
 
 # ==============================================================================
 #  SECTION 1 — SYMBOL RESOLVER
@@ -600,46 +596,36 @@ def send_close_order(broker_sym, position):
 
 # ==============================================================================
 #  SECTION 9 — PER-SYMBOL STATE
+#
+#  The BT allows overlapping positions on the same symbol (up to
+#  max_trades_day per day).  The live engine must match: sym_st holds a list
+#  of open position dicts ("positions") rather than a single state.
+#  Shared counters (bars_since_last, day_trades_count) live at the symbol
+#  level, exactly as the BT signal pre-computation uses them.
 # ==============================================================================
 
 def make_symbol_state():
     return {
-        "state":            STATE_FLAT,
-        "ticket":           None,
-        "direction":        None,
-        "entry_price":      None,
-        "sl_dist":          None,
-        "be_active":        False,
-        "current_sl":       None,
-        "hold_count":       0,
-        "entry_date":       None,
-        "entry_atr":        None,
+        "positions":        [],   # list of open position dicts for this symbol
         "bars_since_last":  9999,
         "day_trades_date":  None,
         "day_trades_count": 0,
     }
 
 
-def _reset_after_close(sym_st):
-    """Reset position fields, preserve daily counter and bars_since_last."""
-    day_trades_date  = sym_st["day_trades_date"]
-    day_trades_count = sym_st["day_trades_count"]
-    bars_since_last  = sym_st["bars_since_last"]
-
-    sym_st["state"]        = STATE_FLAT
-    sym_st["ticket"]       = None
-    sym_st["direction"]    = None
-    sym_st["entry_price"]  = None
-    sym_st["sl_dist"]      = None
-    sym_st["be_active"]    = False
-    sym_st["current_sl"]   = None
-    sym_st["hold_count"]   = 0
-    sym_st["entry_date"]   = None
-    sym_st["entry_atr"]    = None
-
-    sym_st["day_trades_date"]  = day_trades_date
-    sym_st["day_trades_count"] = day_trades_count
-    sym_st["bars_since_last"]  = bars_since_last
+def _make_position_record(ticket, direction, entry_price, sl_dist,
+                           current_sl, entry_date, entry_atr):
+    return {
+        "ticket":      ticket,
+        "direction":   direction,
+        "entry_price": entry_price,
+        "sl_dist":     sl_dist,
+        "be_active":   False,
+        "current_sl":  current_sl,
+        "hold_count":  0,
+        "entry_date":  entry_date,
+        "entry_atr":   entry_atr,
+    }
 
 
 def _reset_daily_counter(sym_st, today):
@@ -649,7 +635,7 @@ def _reset_daily_counter(sym_st, today):
         sym_st["day_trades_count"] = 0
 
 
-def reconstruct_position_state(canon, position):
+def _reconstruct_position_record(canon, position):
     entry_time = datetime.datetime.fromtimestamp(
         position.time, tz=datetime.timezone.utc
     )
@@ -667,25 +653,22 @@ def reconstruct_position_state(canon, position):
         if direction == "short" and sl_price <= ep: be_active = True
 
     logger.info(
-        f"[{canon}] RECOVERED: dir={direction} ep={ep:.5f} "
+        f"[{canon}] RECOVERED ticket={position.ticket}: "
+        f"dir={direction} ep={ep:.5f} "
         f"sl={sl_price:.5f} hold~{hold_count}bars be={be_active}"
     )
-    today = entry_time.date()
-    return {
-        "state":            STATE_IN_POSITION,
-        "ticket":           position.ticket,
-        "direction":        direction,
-        "entry_price":      ep,
-        "sl_dist":          sl_dist,
-        "be_active":        be_active,
-        "current_sl":       sl_price,
-        "hold_count":       hold_count,
-        "entry_date":       today,
-        "entry_atr":        None,
-        "bars_since_last":  0,
-        "day_trades_date":  today,
-        "day_trades_count": 1,
-    }
+    rec = _make_position_record(
+        ticket=position.ticket,
+        direction=direction,
+        entry_price=ep,
+        sl_dist=sl_dist,
+        current_sl=sl_price,
+        entry_date=entry_time.date(),
+        entry_atr=None,
+    )
+    rec["be_active"]   = be_active
+    rec["hold_count"]  = hold_count
+    return rec
 
 
 # ==============================================================================
@@ -695,6 +678,10 @@ def reconstruct_position_state(canon, position):
 def process_symbol(canon, broker_sym, sym_st, params, balance):
     """
     Process one bar for one symbol.
+
+    Supports concurrent open positions on the same symbol (matches BT which
+    allows overlapping trades up to max_trades_day).
+
     today derived from bar timestamp — never wall clock.
     """
     df_m5 = fetch_m5(broker_sym)
@@ -710,68 +697,75 @@ def process_symbol(canon, broker_sym, sym_st, params, balance):
     _reset_daily_counter(sym_st, today)
     sym_st["bars_since_last"] += 1
 
-    positions = mt5.positions_get(symbol=broker_sym) or []
-    positions = [p for p in positions if p.magic == MAGIC]
+    # All broker positions for this symbol owned by this engine
+    broker_positions = mt5.positions_get(symbol=broker_sym) or []
+    broker_positions = [p for p in broker_positions if p.magic == MAGIC]
+    broker_tickets   = {p.ticket for p in broker_positions}
 
-    broker_has_pos = len(positions) > 0
-    state_in_pos   = sym_st["state"] == STATE_IN_POSITION
-
-    if broker_has_pos and not state_in_pos:
-        logger.warning(
-            f"[{canon}] Desync: broker has position, "
-            f"state={sym_st['state']} — recovering"
-        )
-        sym_st.update(reconstruct_position_state(canon, positions[0]))
-        state_in_pos = True
-
-    if not broker_has_pos and state_in_pos:
-        logger.info(f"[{canon}] Position closed server-side (SL hit)")
-        _log_close(canon, sym_st)
-        _reset_after_close(sym_st)
-        return
-
-    if sym_st["state"] == STATE_IN_POSITION:
-        _manage_position(canon, broker_sym, sym_st, params, cache,
-                         positions, today)
-        return
-
-    if sym_st["state"] == STATE_FLAT:
-        direction, or_high_val, or_low_val, atr_val, or_size, sl_dist = \
-            detect_signal_last_bar(
-                cache, params,
-                sym_st["bars_since_last"],
-                sym_st["day_trades_count"],
+    # ── Desync recovery: broker has positions we don't know about ────────────
+    known_tickets = {pr["ticket"] for pr in sym_st["positions"]}
+    for bp in broker_positions:
+        if bp.ticket not in known_tickets:
+            logger.warning(
+                f"[{canon}] Desync: unknown ticket={bp.ticket} — recovering"
+            )
+            rec = _reconstruct_position_record(canon, bp)
+            sym_st["positions"].append(rec)
+            sym_st["day_trades_count"] = min(
+                sym_st["day_trades_count"] + 1, params["max_trades_day"]
             )
 
-        if direction is None:
-            return
-
+    # ── Detect positions closed server-side (SL hit) ─────────────────────────
+    closed_records = [pr for pr in sym_st["positions"]
+                      if pr["ticket"] not in broker_tickets]
+    for pr in closed_records:
         logger.info(
-            f"[{canon}] SIGNAL {direction.upper()} "
-            f"or_high={or_high_val:.5f} or_low={or_low_val:.5f} "
-            f"or_size={or_size:.5f} sl_dist={sl_dist:.5f} "
-            f"atr={atr_val:.5f} "
-            f"(day_trades={sym_st['day_trades_count']+1}/"
-            f"{params['max_trades_day']} "
-            f"bars_since_last={sym_st['bars_since_last']})"
+            f"[{canon}] ticket={pr['ticket']} closed server-side (SL hit)"
+        )
+        _log_close_record(canon, pr)
+        sym_st["positions"].remove(pr)
+
+    # ── Manage each open position ────────────────────────────────────────────
+    broker_pos_map = {p.ticket: p for p in broker_positions}
+    for pr in list(sym_st["positions"]):
+        bp = broker_pos_map.get(pr["ticket"])
+        _manage_position_record(canon, broker_sym, pr, params, cache,
+                                bp, today, sym_st)
+
+    # ── Check for new entry signal ───────────────────────────────────────────
+    direction, or_high_val, or_low_val, atr_val, or_size, sl_dist = \
+        detect_signal_last_bar(
+            cache, params,
+            sym_st["bars_since_last"],
+            sym_st["day_trades_count"],
         )
 
-        # Claim slot before risk guard so counters are always truthful
-        sym_st["bars_since_last"]  = 0
-        sym_st["day_trades_count"] += 1
+    if direction is None:
+        return
 
-        _execute_entry(canon, broker_sym, sym_st, params,
-                       balance, today, direction, sl_dist, atr_val)
+    logger.info(
+        f"[{canon}] SIGNAL {direction.upper()} "
+        f"or_high={or_high_val:.5f} or_low={or_low_val:.5f} "
+        f"or_size={or_size:.5f} sl_dist={sl_dist:.5f} "
+        f"atr={atr_val:.5f} "
+        f"(day_trades={sym_st['day_trades_count']+1}/"
+        f"{params['max_trades_day']} "
+        f"bars_since_last={sym_st['bars_since_last']})"
+    )
+
+    # Claim slot before risk guard so counters are always truthful
+    sym_st["bars_since_last"]  = 0
+    sym_st["day_trades_count"] += 1
+
+    _execute_entry(canon, broker_sym, sym_st, params,
+                   balance, today, direction, sl_dist, atr_val)
 
 
 def _execute_entry(canon, broker_sym, sym_st, params,
                    balance, today, direction, sl_dist, atr_val):
     """
     Place market order on signal bar close.
-
-    SL formula mirrors BT resolve_trade():
-      sl_dist passed in = max(sl_range_mult * or_size, atr * 0.05)
-      min_sl_dist = 0.05 * atr applied here (same as BT after entry known)
+    On success, appends a new position record to sym_st["positions"].
     """
     tick = mt5.symbol_info_tick(broker_sym)
     if tick is None:
@@ -833,122 +827,130 @@ def _execute_entry(canon, broker_sym, sym_st, params,
         actual_ep = ep
         actual_sl = sl_price
 
-    sym_st["state"]        = STATE_IN_POSITION
-    sym_st["ticket"]       = ticket
-    sym_st["direction"]    = direction
-    sym_st["entry_price"]  = actual_ep
-    sym_st["sl_dist"]      = sl_dist
-    sym_st["be_active"]    = False
-    sym_st["current_sl"]   = actual_sl
-    sym_st["hold_count"]   = 0
-    sym_st["entry_date"]   = today
-    sym_st["entry_atr"]    = atr_val
+    rec = _make_position_record(
+        ticket=ticket,
+        direction=direction,
+        entry_price=actual_ep,
+        sl_dist=sl_dist,
+        current_sl=actual_sl,
+        entry_date=today,
+        entry_atr=atr_val,
+    )
+    sym_st["positions"].append(rec)
 
     logger.info(
-        f"[{canon}] ENTERED {direction.upper()} "
+        f"[{canon}] ENTERED {direction.upper()} ticket={ticket} "
         f"ep={actual_ep:.5f} sl={actual_sl:.5f} "
-        f"sl_dist={sl_dist:.5f} lot={lot} ticket={ticket}"
+        f"sl_dist={sl_dist:.5f} lot={lot} "
+        f"open_positions={len(sym_st['positions'])}"
     )
 
 
-def _manage_position(canon, broker_sym, sym_st, params, cache, positions, today):
+def _manage_position_record(canon, broker_sym, pr, params, cache,
+                             broker_pos, today, sym_st):
     """
-    Manage open position for one bar.
-
-    EOD, breakeven, and trailing logic are all identical to BT resolve_trade().
+    Manage one open position record for one bar.
+    Identical EOD, breakeven, and trailing logic to BT resolve_trade().
+    Removes the record from sym_st["positions"] on close.
     """
     i         = cache["n"] - 1
-    direction = sym_st["direction"]
-    ep        = sym_st["entry_price"]
-    sl_dist   = sym_st["sl_dist"]
+    direction = pr["direction"]
+    ep        = pr["entry_price"]
+    sl_dist   = pr["sl_dist"]
     atr_cur   = cache["atr14"][i]
     bar_h     = cache["h"][i]
     bar_l     = cache["l"][i]
     cfg       = cache["cfg"]
 
-    sym_st["hold_count"] += 1
-    hc  = sym_st["hold_count"]
-    pos = positions[0] if positions else None
+    pr["hold_count"] += 1
+    hc = pr["hold_count"]
 
     # ── EOD — bar timestamp date and bar timestamp hour ──────────────────────
     # Matches BT: dates[bi] != entry_date or utc_h[bi] >= cfg["close_h"]
     current_bar_hour = int(cache["utc_h"][i])
-    if sym_st["entry_date"] != today or current_bar_hour >= cfg["close_h"]:
+    if pr["entry_date"] != today or current_bar_hour >= cfg["close_h"]:
         logger.info(
-            f"[{canon}] EOD exit "
-            f"(entry_date={sym_st['entry_date']} bar_date={today} "
+            f"[{canon}] EOD exit ticket={pr['ticket']} "
+            f"(entry_date={pr['entry_date']} bar_date={today} "
             f"bar_utc_hour={current_bar_hour} close_h={cfg['close_h']})"
         )
-        if pos:
-            send_close_order(broker_sym, pos)
-        _log_close(canon, sym_st)
-        _reset_after_close(sym_st)
+        if broker_pos:
+            send_close_order(broker_sym, broker_pos)
+        _log_close_record(canon, pr)
+        sym_st["positions"].remove(pr)
         return
 
     if hc >= MAX_HOLD:
-        logger.info(f"[{canon}] MAX HOLD ({MAX_HOLD} bars) — closing")
-        if pos:
-            send_close_order(broker_sym, pos)
-        _log_close(canon, sym_st)
-        _reset_after_close(sym_st)
+        logger.info(
+            f"[{canon}] MAX HOLD ({MAX_HOLD} bars) ticket={pr['ticket']} — closing"
+        )
+        if broker_pos:
+            send_close_order(broker_sym, broker_pos)
+        _log_close_record(canon, pr)
+        sym_st["positions"].remove(pr)
         return
 
     # ── Breakeven — identical to BT ──────────────────────────────────────────
     one_r = ep + (sl_dist if direction == "long" else -sl_dist)
-    if not sym_st["be_active"]:
+    if not pr["be_active"]:
         triggered = (
             (direction == "long"  and bar_h >= one_r) or
             (direction == "short" and bar_l <= one_r)
         )
         if triggered:
-            sym_st["be_active"]  = True
-            sym_st["current_sl"] = ep
-            logger.info(f"[{canon}] BE triggered — SL -> {ep:.5f}")
+            pr["be_active"]  = True
+            pr["current_sl"] = ep
+            logger.info(
+                f"[{canon}] BE triggered ticket={pr['ticket']} — SL -> {ep:.5f}"
+            )
 
     # ── Trailing stop — identical to BT ─────────────────────────────────────
-    if sym_st["be_active"]:
+    if pr["be_active"]:
         ta = atr_cur
         if np.isnan(ta) or ta <= 0:
-            ta = sym_st["entry_atr"] or sl_dist
+            ta = pr["entry_atr"] or sl_dist
         trail_mult = params["trail_atr_mult"]
         if direction == "long":
-            sym_st["current_sl"] = max(sym_st["current_sl"],
-                                       bar_h - trail_mult * ta)
+            pr["current_sl"] = max(pr["current_sl"], bar_h - trail_mult * ta)
         else:
-            sym_st["current_sl"] = min(sym_st["current_sl"],
-                                       bar_l + trail_mult * ta)
+            pr["current_sl"] = min(pr["current_sl"], bar_l + trail_mult * ta)
 
     # ── Push updated SL to broker ────────────────────────────────────────────
-    if pos is not None:
-        broker_sl = pos.sl or 0.0
-        new_sl    = sym_st["current_sl"]
+    if broker_pos is not None:
+        broker_sl = broker_pos.sl or 0.0
+        new_sl    = pr["current_sl"]
         sym_info  = mt5.symbol_info(broker_sym)
         pip       = (10 ** (-sym_info.digits + 1)) if sym_info else 0.0001
         if abs(new_sl - broker_sl) >= pip:
-            if modify_sl(broker_sym, sym_st["ticket"], new_sl):
+            if modify_sl(broker_sym, pr["ticket"], new_sl):
                 logger.info(
-                    f"[{canon}] SL updated {broker_sl:.5f} -> {new_sl:.5f} "
-                    f"(hold={hc} be={sym_st['be_active']})"
+                    f"[{canon}] SL updated ticket={pr['ticket']} "
+                    f"{broker_sl:.5f} -> {new_sl:.5f} "
+                    f"(hold={hc} be={pr['be_active']})"
                 )
 
 
-def _log_close(canon, sym_st):
-    ticket = sym_st.get("ticket")
+def _log_close_record(canon, pr):
+    ticket = pr.get("ticket")
     if not ticket:
         return
     try:
         deals = mt5.history_deals_get(position=ticket)
         if deals and len(deals) >= 2:
-            ep      = sym_st.get("entry_price", 0)
-            sl_dist = sym_st.get("sl_dist", 1)
+            ep      = pr.get("entry_price", 0)
+            sl_dist = pr.get("sl_dist", 1)
             close_p = deals[-1].price
-            sign    = 1 if sym_st.get("direction") == "long" else -1
+            sign    = 1 if pr.get("direction") == "long" else -1
             r_val   = sign * (close_p - ep) / sl_dist if sl_dist > 0 else 0.0
-            logger.info(f"[{canon}] CLOSED price={close_p:.5f} R={r_val:+.3f}")
+            logger.info(
+                f"[{canon}] CLOSED ticket={ticket} "
+                f"price={close_p:.5f} R={r_val:+.3f}"
+            )
         else:
-            logger.info(f"[{canon}] CLOSED (deal history unavailable)")
+            logger.info(f"[{canon}] CLOSED ticket={ticket} "
+                        f"(deal history unavailable)")
     except Exception as e:
-        logger.info(f"[{canon}] CLOSED (history error: {e})")
+        logger.info(f"[{canon}] CLOSED ticket={ticket} (history error: {e})")
 
 
 # ==============================================================================
@@ -1082,18 +1084,25 @@ def run_live():
         positions = mt5.positions_get(symbol=broker) or []
         positions = [p for p in positions if p.magic == MAGIC]
         if positions:
-            pos = positions[0]
-            if COMMENT in (pos.comment or ""):
-                sym_states[canon].update(
-                    reconstruct_position_state(canon, pos)
-                )
-            else:
-                logger.warning(
-                    f"  {canon}: ticket={pos.ticket} "
-                    f"comment='{pos.comment}' — not from this engine, skipping"
-                )
+            for pos in positions:
+                if COMMENT in (pos.comment or ""):
+                    rec = _reconstruct_position_record(canon, pos)
+                    sym_states[canon]["positions"].append(rec)
+                    sym_states[canon]["day_trades_count"] = min(
+                        sym_states[canon]["day_trades_count"] + 1,
+                        BEST_PARAMS[canon]["max_trades_day"]
+                    )
+                else:
+                    logger.warning(
+                        f"  {canon}: ticket={pos.ticket} "
+                        f"comment='{pos.comment}' — not from this engine, skipping"
+                    )
+            logger.info(
+                f"  {canon}: recovered "
+                f"{len(sym_states[canon]['positions'])} position(s)"
+            )
         else:
-            logger.info(f"  {canon}: no open position")
+            logger.info(f"  {canon}: no open positions")
     logger.info("=== END RECOVERY ===")
 
     logger.info("=== ACTIVE PARAMS ===")
