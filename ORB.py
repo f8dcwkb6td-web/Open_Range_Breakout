@@ -65,6 +65,7 @@ COMMENT: "ORB_V3"
 """
 
 import os, sys, io, time, logging, datetime, bisect
+import threading
 import numpy as np
 import pandas as pd
 from logging.handlers import RotatingFileHandler
@@ -111,7 +112,7 @@ ATR_PCT_THRESH    = 0.30
 WARMUP_M5         = 200
 MAX_RISK_MULTIPLE = 2.0
 
-FETCH_BARS_M5 = 5000
+FETCH_BARS_M5 = 600   # warmup(200) + OR(12) + ATR(14) + generous buffer — nothing more needed live
 
 OR_BARS = {15: 3, 30: 6, 60: 12}
 
@@ -175,6 +176,9 @@ SYMBOL_ALIASES = {
 }
 
 SYMBOLS = list(SESSION.keys())
+
+# Tick values cached at startup — symbol_info is slow, no need to call every bar
+_tick_value_cache: dict = {}
 
 
 # ==============================================================================
@@ -428,18 +432,18 @@ def compute_lot_size(broker_sym, sl_dist, balance):
     """
     Lot = balance * risk / (sl_dist * tick_value_per_lot), floored to vol_min.
     Identical to BT compute_lot_aware().
+    Uses cached tick value and symbol constraints — no symbol_info call per bar.
     Returns (lot, tick_value_per_lot) or (None, None) on error.
     """
-    info = mt5.symbol_info(broker_sym)
-    if info is None:
-        logger.error(f"[{broker_sym}] symbol_info returned None")
+    cached = _tick_value_cache.get(broker_sym)
+    if cached is None:
+        logger.error(f"[{broker_sym}] not in tick_value_cache — was startup skipped?")
         return None, None
 
-    if info.trade_tick_size <= 0:
-        logger.error(f"[{broker_sym}] trade_tick_size <= 0")
-        return None, None
-
-    tick_value_per_lot = info.trade_tick_value / info.trade_tick_size
+    tick_value_per_lot = cached["tick_value_per_lot"]
+    vol_min            = cached["vol_min"]
+    vol_max            = cached["vol_max"]
+    step               = cached["vol_step"]
 
     if sl_dist < 1e-9:
         logger.error(f"[{broker_sym}] sl_dist ~ 0")
@@ -447,10 +451,6 @@ def compute_lot_size(broker_sym, sl_dist, balance):
 
     risk_amount = balance * RISK_PER_TRADE
     raw_lot     = risk_amount / (sl_dist * tick_value_per_lot)
-
-    step    = info.volume_step if info.volume_step > 0 else 0.01
-    vol_min = info.volume_min  if info.volume_min  > 0 else 0.01
-    vol_max = info.volume_max  if info.volume_max  > 0 else 100.0
 
     lot = max(vol_min, min(vol_max, round(raw_lot / step) * step))
     lot = round(lot, 8)
@@ -813,9 +813,14 @@ def _execute_entry(canon, broker_sym, sym_st, params,
         sym_st["bars_since_last"]  = params["cooldown_bars"]
         return
 
-    time.sleep(0.5)
-    filled = [p for p in (mt5.positions_get(symbol=broker_sym) or [])
-              if p.magic == MAGIC and p.ticket == ticket]
+    # Fast fill confirm — poll up to 300ms instead of unconditional 500ms sleep
+    filled = []
+    for _ in range(6):
+        time.sleep(0.05)
+        filled = [p for p in (mt5.positions_get(symbol=broker_sym) or [])
+                  if p.magic == MAGIC and p.ticket == ticket]
+        if filled:
+            break
 
     if filled:
         actual_ep = filled[0].price_open
@@ -919,8 +924,7 @@ def _manage_position_record(canon, broker_sym, pr, params, cache,
     if broker_pos is not None:
         broker_sl = broker_pos.sl or 0.0
         new_sl    = pr["current_sl"]
-        sym_info  = mt5.symbol_info(broker_sym)
-        pip       = (10 ** (-sym_info.digits + 1)) if sym_info else 0.0001
+        pip       = _tick_value_cache.get(broker_sym, {}).get("pip", 0.0001)
         if abs(new_sl - broker_sl) >= pip:
             if modify_sl(broker_sym, pr["ticket"], new_sl):
                 logger.info(
@@ -1030,6 +1034,14 @@ class Metrics:
             self.report(balance)
 
 
+def _process_symbol_safe(canon, broker, sym_st, params, balance):
+    """Thread wrapper — catches exceptions so one symbol never kills others."""
+    try:
+        process_symbol(canon, broker, sym_st, params, balance)
+    except Exception as e:
+        logger.exception(f"[{canon}] Error in process_symbol: {e}")
+
+
 # ==============================================================================
 #  SECTION 13 — MAIN LOOP
 # ==============================================================================
@@ -1058,13 +1070,24 @@ def run_live():
     for canon in active_symbols:
         broker = sym_map[canon]
         info   = mt5.symbol_info(broker)
-        tvpl   = (info.trade_tick_value / info.trade_tick_size
-                  if info and info.trade_tick_size > 0 else "N/A")
+        if info is None:
+            logger.error(f"  {canon}: symbol_info None — skipping")
+            continue
+        tvpl = (info.trade_tick_value / info.trade_tick_size
+                if info.trade_tick_size > 0 else 1.0)
+        pip  = 10 ** (-info.digits + 1)
+        _tick_value_cache[broker] = {
+            "tick_value_per_lot": tvpl,
+            "vol_min":  info.volume_min  if info.volume_min  > 0 else 0.01,
+            "vol_max":  info.volume_max  if info.volume_max  > 0 else 100.0,
+            "vol_step": info.volume_step if info.volume_step > 0 else 0.01,
+            "pip":      pip,
+        }
         logger.info(
             f"  {canon} ({broker}): digits={info.digits} "
-            f"tick_val/lot={tvpl} "
+            f"tick_val/lot={tvpl:.6f} "
             f"vol_min={info.volume_min} vol_step={info.volume_step} "
-            f"params={BEST_PARAMS[canon]}"
+            f"pip={pip} params={BEST_PARAMS[canon]}"
         )
     logger.info(f"  Risk guard: MAX_RISK_MULTIPLE={MAX_RISK_MULTIPLE}x")
     logger.info("=== END DIAGNOSTIC ===")
@@ -1143,17 +1166,21 @@ def run_live():
 
             balance = mt5.account_info().balance
 
+            threads = []
             for canon in active_symbols:
                 broker = sym_map[canon]
                 params = BEST_PARAMS[canon]
-                try:
-                    process_symbol(
-                        canon, broker, sym_states[canon], params, balance
-                    )
-                except Exception as sym_err:
-                    logger.exception(
-                        f"[{canon}] Error in process_symbol: {sym_err}"
-                    )
+                t = threading.Thread(
+                    target=_process_symbol_safe,
+                    args=(canon, broker, sym_states[canon], params, balance),
+                    daemon=True,
+                )
+                threads.append(t)
+
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=25)  # hard cap per bar — never block the clock
 
             metrics.check_hourly(balance)
 
