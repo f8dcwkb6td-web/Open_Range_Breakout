@@ -112,7 +112,7 @@ ATR_PCT_THRESH    = 0.30
 WARMUP_M5         = 200
 MAX_RISK_MULTIPLE = 2.0
 
-FETCH_BARS_M5 = 600   # warmup(200) + OR(12) + ATR(14) + generous buffer — nothing more needed live
+FETCH_BARS_M5 = 2000   # warmup(200) + OR(12) + ATR(14) + generous buffer — nothing more needed live
 
 OR_BARS = {15: 3, 30: 6, 60: 12}
 
