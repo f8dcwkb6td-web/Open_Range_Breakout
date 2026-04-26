@@ -85,9 +85,9 @@ logger.addHandler(_sh)
 TERMINAL_PATH = os.environ.get(
     "MT5_TERMINAL_PATH", r"C:\Program Files\MetaTrader 5\terminal64.exe"
 )
-LOGIN    = int(os.environ.get("MT5_LOGIN",    0))
-PASSWORD =     os.environ.get("MT5_PASSWORD", "")
-SERVER   =     os.environ.get("MT5_SERVER",   "")
+LOGIN    = 1513214612
+PASSWORD = "h2QE?*1!v5fQ"
+SERVER   = "FTMO-Demo"
 
 # ── Engine identity ───────────────────────────────────────────────────────────
 MAGIC   = 202603262
