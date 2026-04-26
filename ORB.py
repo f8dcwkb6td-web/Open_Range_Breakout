@@ -18,9 +18,12 @@ CHANGES vs v3:
   + Full parity audit carried forward from v3.
 
 STARTUP FLOW:
-  1. fetch_m5_full()  — 500k bars per symbol, build full cache + ATR history
-  2. update_atr_incremental() — appends one new bar, updates ATR in-place
-  3. process_symbol() — signal detection on last bar of cache, same as v3
+  1. fetch_m5_full()  — copy_rates_range pre-warm forces broker history
+                        download, then copy_rates_from_pos up to 500k bars.
+                        Cache is trimmed to exactly CACHE_MAX_BARS rows.
+  2. update_atr_incremental() — appends one new bar, updates ATR in-place,
+                                trims cache back to CACHE_MAX_BARS.
+  3. process_symbol() — signal detection on last bar of cache, same as v3.
 
 DAILY BUDGET LOGIC (matches BT run_eval_simulation / compute_vol_max_cap):
   DAILY_LOSS_BUDGET = STARTING_BALANCE * 4.75%  = $1,187.50  (fixed)
@@ -97,12 +100,13 @@ MAX_RISK_MULTIPLE = 2.0
 
 # Daily loss budget — fixed to STARTING_BALANCE, matches BT exactly.
 # vol_max_cap = per_trade_allowance / (sl_dist * tick_val)
-# This is a ceiling on lot size; vol_min floor always applies.
+# This is a ceiling on lot size; vol_min floor always applies regardless.
 DAILY_LOSS_CAP_PCT = 0.0475
 DAILY_LOSS_BUDGET  = STARTING_BALANCE * DAILY_LOSS_CAP_PCT   # $1,187.50
 
 # ── Strategy constants ────────────────────────────────────────────────────────
-FETCH_BARS_STARTUP = 500_000   # full history fetch at startup
+FETCH_BARS_STARTUP = 500_000   # target bars at startup (and rolling cap)
+CACHE_MAX_BARS     = 500_000   # hard cap: trim to this after every append
 MAX_HOLD           = 48
 ATR_PERIOD         = 14
 ATR_PCT_THRESH     = 0.30
@@ -162,7 +166,8 @@ _tick_value_cache: dict = {}
 # Per-symbol bar cache — populated at startup, updated incrementally
 # Structure per symbol:
 #   {
-#     "o","h","l","c": np.ndarray  (full history, grows by 1 each bar)
+#     "o","h","l","c": np.ndarray  (rolling CACHE_MAX_BARS, grows by 1 each bar
+#                                   then trimmed back to cap)
 #     "utc_h","utc_m": np.ndarray int32
 #     "dates":         np.ndarray  (object, datetime.date)
 #     "times":         np.ndarray  (datetime64[ns])
@@ -171,6 +176,7 @@ _tick_value_cache: dict = {}
 #     "atr_pct":       np.ndarray  (expanding pct rank, updated incrementally)
 #     "atr_pct_hist":  list        (sorted history for bisect — expanding rank)
 #     "last_bar_time": pd.Timestamp
+#     "n":             int         (current cache length, capped at CACHE_MAX_BARS)
 #   }
 _bar_cache: dict = {}
 
@@ -286,19 +292,39 @@ def expanding_pct_rank_update(hist, new_atr_val):
 #  SECTION 3 — STARTUP: FULL FETCH + CACHE BUILD
 # ==============================================================================
 
+def _prewarm_history(broker_sym):
+    """
+    Fire copy_rates_range from 2010 to now — this tells the MT5 terminal to
+    request the full history from the broker server.  Without this call,
+    copy_rates_from_pos only returns whatever the terminal has already cached
+    locally (often ~50k bars).  The actual download happens asynchronously
+    inside the terminal; we sleep after to let it complete before the real
+    fetch.
+    """
+    seed_from = datetime.datetime(2010, 1, 1, tzinfo=datetime.timezone.utc)
+    seed_to   = datetime.datetime.now(datetime.timezone.utc)
+    rates = mt5.copy_rates_range(broker_sym, mt5.TIMEFRAME_M5, seed_from, seed_to)
+    n_probe = len(rates) if rates is not None else 0
+    logger.info(
+        f"  [{broker_sym}] history pre-warm: copy_rates_range returned "
+        f"{n_probe:,} bars (terminal is now downloading full history)"
+    )
+
+
 def fetch_m5_full(broker_sym):
     """
     Fetch up to FETCH_BARS_STARTUP M5 bars at startup.
     Drops the last (incomplete live) bar.
+    Trims result to CACHE_MAX_BARS rows (newest bars kept).
 
-    Robustness steps before fetching:
-      1. Ensure symbol is selected/visible so terminal requests history.
-      2. Wait up to 3s for terminal to subscribe and populate ticks.
-      3. Try descending bar counts so a broker history cap doesn't silently
-         return None.
-      4. Log MT5 last_error() on every failure so the cause is visible.
+    Strategy:
+      1. Ensure symbol visible.
+      2. copy_rates_range(2010→now) pre-warm — forces broker history download.
+      3. Sleep 15 s to let the terminal finish the download.
+      4. Retry copy_rates_from_pos with descending counts until we either
+         reach ≥80% of the requested count or exhaust the attempt list.
+      5. Log the oldest bar date so the operator knows how deep history goes.
     """
-    # Step 1: force symbol selection
     info = mt5.symbol_info(broker_sym)
     if info is None:
         logger.error(
@@ -316,38 +342,69 @@ def fetch_m5_full(broker_sym):
                 f"MT5 error: {mt5.last_error()}"
             )
             return None
-        # Give terminal time to subscribe and receive history
         time.sleep(3)
-        logger.info(f"[{broker_sym}] selected — waiting for data...")
 
-    # Step 2: try descending bar counts
-    attempts = [FETCH_BARS_STARTUP, 100_000, 50_000, 10_000, 5_000]
+    # ── Step 1: pre-warm — forces terminal to pull full history from broker ───
+    logger.info(f"[{broker_sym}] pre-warming history (copy_rates_range 2010→now)...")
+    _prewarm_history(broker_sym)
+    logger.info(f"[{broker_sym}] sleeping 15 s for terminal to finish download...")
+    time.sleep(15)
+
+    # ── Step 2: fetch with descending fallback counts ─────────────────────────
+    attempts = [500_000, 300_000, 200_000, 100_000, 50_000]
     rates    = None
+
     for n_bars in attempts:
         rates = mt5.copy_rates_from_pos(
             broker_sym, mt5.TIMEFRAME_M5, 0, n_bars + 1
         )
-        if rates is not None and len(rates) >= WARMUP_M5 + ATR_PERIOD + 50:
+        n_got = len(rates) if rates is not None else 0
+        err   = mt5.last_error()
+
+        if rates is not None and n_got >= WARMUP_M5 + ATR_PERIOD + 50:
+            oldest_ts = pd.Timestamp(rates[0]["time"], unit="s")
+            days_back = (pd.Timestamp.utcnow() - oldest_ts).days
             logger.info(
-                f"[{broker_sym}] fetched {len(rates):,} bars "
-                f"(requested {n_bars:,})"
+                f"[{broker_sym}] fetch {n_bars:,}: got {n_got:,} bars | "
+                f"oldest={oldest_ts.date()} ({days_back}d back)"
             )
-            break
-        err = mt5.last_error()
-        logger.warning(
-            f"[{broker_sym}] fetch attempt {n_bars:,} bars → "
-            f"got {len(rates) if rates is not None else 0} bars  "
-            f"MT5 error: {err}"
-        )
-        time.sleep(1)
-    else:
+
+            if n_got >= int(n_bars * 0.8):
+                # Got ≥80% of what we asked — good enough, stop here
+                break
+            else:
+                # Terminal may still be syncing — wait and retry same count once
+                logger.warning(
+                    f"[{broker_sym}] only {n_got:,}/{n_bars:,} bars — "
+                    f"terminal still syncing? Waiting 10 s and retrying..."
+                )
+                time.sleep(10)
+                rates2 = mt5.copy_rates_from_pos(
+                    broker_sym, mt5.TIMEFRAME_M5, 0, n_bars + 1
+                )
+                n_got2 = len(rates2) if rates2 is not None else 0
+                if rates2 is not None and n_got2 > n_got:
+                    rates = rates2
+                    logger.info(
+                        f"[{broker_sym}] retry gained {n_got2 - n_got:,} more bars "
+                        f"({n_got2:,} total)"
+                    )
+                break   # take the best we have and move on
+        else:
+            logger.warning(
+                f"[{broker_sym}] fetch attempt {n_bars:,} bars → "
+                f"got {n_got} bars  MT5 error: {err}"
+            )
+            time.sleep(2)
+
+    if rates is None or len(rates) < WARMUP_M5 + ATR_PERIOD + 50:
         logger.error(
             f"[{broker_sym}] all fetch attempts failed.  "
             f"Last MT5 error: {mt5.last_error()}"
         )
         return None
 
-    # Step 3: build DataFrame
+    # ── Step 3: build DataFrame ───────────────────────────────────────────────
     cols = ["time", "open", "high", "low", "close",
             "tick_volume", "spread", "real_volume"]
     df = pd.DataFrame(rates, columns=cols)[
@@ -358,6 +415,14 @@ def fetch_m5_full(broker_sym):
     df["utc_minute"] = df["time_utc"].dt.minute
     df["date"]       = df["time_utc"].dt.date
     df = df.iloc[:-1].reset_index(drop=True)   # drop live incomplete bar
+
+    # ── Step 4: trim to CACHE_MAX_BARS (keep newest) ──────────────────────────
+    if len(df) > CACHE_MAX_BARS:
+        logger.info(
+            f"[{broker_sym}] trimming {len(df):,} → {CACHE_MAX_BARS:,} bars "
+            f"(keeping newest)"
+        )
+        df = df.iloc[-CACHE_MAX_BARS:].reset_index(drop=True)
 
     logger.info(
         f"[{broker_sym}] cache range: "
@@ -438,9 +503,29 @@ def fetch_latest_closed_bar(broker_sym):
     return t, float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"])
 
 
+def _trim_cache(cache):
+    """
+    Trim all cache arrays to the newest CACHE_MAX_BARS entries.
+    Called after every append so the cache never grows beyond the cap.
+    The atr_pct_hist sorted list is NOT trimmed — it represents the full
+    expanding population and must stay intact for correct pct-rank values.
+    """
+    n = cache["n"]
+    if n <= CACHE_MAX_BARS:
+        return
+
+    drop = n - CACHE_MAX_BARS
+    for key in ("o", "h", "l", "c", "utc_h", "utc_m",
+                "dates", "times", "atr14", "atr_pct"):
+        cache[key] = cache[key][drop:]
+
+    cache["n"] = CACHE_MAX_BARS
+
+
 def append_bar_to_cache(canon, bar_time, o, h, l, c):
     """
-    Append one new bar to all cache arrays and update ATR incrementally.
+    Append one new bar to all cache arrays, update ATR incrementally,
+    then trim to CACHE_MAX_BARS.
     Called once per M5 bar after wait_for_new_bar() fires.
     """
     cache = _bar_cache[canon]
@@ -479,6 +564,9 @@ def append_bar_to_cache(canon, bar_time, o, h, l, c):
     cache["atr_pct_hist"]    = hist
     cache["last_bar_time"]   = bar_time
     cache["n"]               = cache["n"] + 1
+
+    # ── Trim to rolling cap ───────────────────────────────────────────────────
+    _trim_cache(cache)
 
     return True
 
@@ -838,7 +926,7 @@ def _reconstruct_position_record(canon, position):
         f"hold~{hold_count}bars be={be_active}"
     )
     rec = _make_position_record(
-        ticket=ticket, direction=direction, entry_price=ep,
+        ticket=position.ticket, direction=direction, entry_price=ep,
         sl_dist=sl_dist, current_sl=sl_price,
         entry_date=entry_time.date(), entry_atr=None,
     )
@@ -1244,11 +1332,36 @@ def run_live():
         mt5.shutdown()
         return
 
-    # ── Startup 500k-bar fetch — build full ATR cache ─────────────────────────
-    logger.info(f"\n=== STARTUP FETCH ({FETCH_BARS_STARTUP:,} bars) ===")
+    # ── Pre-warm: fire copy_rates_range for ALL symbols before sleeping ───────
+    # This sends broker history requests in parallel (terminal handles async).
+    # We fire all of them first, then sleep once for all.
+    logger.info(
+        f"\n=== HISTORY PRE-WARM (copy_rates_range 2010→now, all symbols) ==="
+    )
+    seed_from = datetime.datetime(2010, 1, 1, tzinfo=datetime.timezone.utc)
+    seed_to   = datetime.datetime.now(datetime.timezone.utc)
     for canon in active_symbols:
         broker = sym_map[canon]
-        logger.info(f"  [{canon}] fetching {FETCH_BARS_STARTUP:,} bars...")
+        rates_probe = mt5.copy_rates_range(
+            broker, mt5.TIMEFRAME_M5, seed_from, seed_to
+        )
+        n_probe = len(rates_probe) if rates_probe is not None else 0
+        logger.info(
+            f"  [{canon}] pre-warm probe: {n_probe:,} bars returned "
+            f"(terminal now downloading full history from broker)"
+        )
+    logger.info("  Sleeping 15 s for terminal to finish downloading...")
+    time.sleep(15)
+    logger.info("=== END PRE-WARM ===\n")
+
+    # ── Startup 500k-bar fetch — build full ATR cache ─────────────────────────
+    logger.info(
+        f"=== STARTUP FETCH (target {FETCH_BARS_STARTUP:,} bars, "
+        f"cap {CACHE_MAX_BARS:,}) ==="
+    )
+    for canon in active_symbols:
+        broker = sym_map[canon]
+        logger.info(f"  [{canon}] fetching up to {FETCH_BARS_STARTUP:,} bars...")
         df = fetch_m5_full(broker)
         if df is None:
             logger.error(f"  [{canon}] startup fetch failed — cannot trade this symbol")
@@ -1299,7 +1412,8 @@ def run_live():
     logger.info(
         f"  RISK={RISK_PER_TRADE:.2%}  MAX_HOLD={MAX_HOLD}bars  "
         f"ATR_PCT_THRESH={ATR_PCT_THRESH}  WARMUP={WARMUP_M5}bars  "
-        f"MAX_RISK_MULTIPLE={MAX_RISK_MULTIPLE}x"
+        f"MAX_RISK_MULTIPLE={MAX_RISK_MULTIPLE}x  "
+        f"CACHE_MAX_BARS={CACHE_MAX_BARS:,}"
     )
     logger.info("=== END PARAMS ===\n")
 
@@ -1337,7 +1451,12 @@ def run_live():
                     continue
                 bar_time, o, h, l, c = bar
                 added = append_bar_to_cache(canon, bar_time, o, h, l, c)
-                if not added:
+                if added:
+                    cache = _bar_cache[canon]
+                    logger.debug(
+                        f"[{canon}] cache size after append: {cache['n']:,}"
+                    )
+                else:
                     logger.debug(f"[{canon}] duplicate bar {bar_time} — skipped")
 
             # ── Step 2: process signal + position management ───────────────────
