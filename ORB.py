@@ -1269,10 +1269,20 @@ def _process_symbol_safe(canon, broker, sym_st, params, balance):
 def run_live():
     global _CLOCK_SYM_BROKER, _MAX_TRADES_DAY_COMBO
 
-    if not mt5.initialize(
-        path=TERMINAL_PATH, login=LOGIN, password=PASSWORD, server=SERVER
-    ):
+    if not mt5.initialize(path=TERMINAL_PATH):
+        print(f"MT5 initialize failed: {mt5.last_error()}")
         raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
+
+    print(f"MT5 initialize OK — last_error={mt5.last_error()}")
+
+    authorized = mt5.login(LOGIN, password=PASSWORD, server=SERVER)
+    print(f"Login result: {authorized}")
+    print(f"last_error after login: {mt5.last_error()}")
+    print(f"account_info: {mt5.account_info()}")
+
+    if not authorized:
+        mt5.shutdown()
+        raise RuntimeError(f"MT5 login failed: {mt5.last_error()}")
 
     acct = mt5.account_info()
     logger.info(
