@@ -102,7 +102,7 @@ DAILY_LOSS_CAP_PCT = 0.0475
 DAILY_LOSS_BUDGET  = STARTING_BALANCE * DAILY_LOSS_CAP_PCT   # $1,187.50
 
 # ── Strategy constants ────────────────────────────────────────────────────────
-FETCH_BARS_STARTUP = 5000  # full history fetch at startup
+FETCH_BARS_STARTUP = 500_000   # full history fetch at startup
 MAX_HOLD           = 48
 ATR_PERIOD         = 14
 ATR_PCT_THRESH     = 0.30
@@ -290,17 +290,64 @@ def fetch_m5_full(broker_sym):
     """
     Fetch up to FETCH_BARS_STARTUP M5 bars at startup.
     Drops the last (incomplete live) bar.
-    Returns DataFrame or None.
+
+    Robustness steps before fetching:
+      1. Ensure symbol is selected/visible so terminal requests history.
+      2. Wait up to 3s for terminal to subscribe and populate ticks.
+      3. Try descending bar counts so a broker history cap doesn't silently
+         return None.
+      4. Log MT5 last_error() on every failure so the cause is visible.
     """
-    rates = mt5.copy_rates_from_pos(
-        broker_sym, mt5.TIMEFRAME_M5, 0, FETCH_BARS_STARTUP + 1
-    )
-    if rates is None or len(rates) < WARMUP_M5 + ATR_PERIOD + 50:
+    # Step 1: force symbol selection
+    info = mt5.symbol_info(broker_sym)
+    if info is None:
         logger.error(
-            f"[{broker_sym}] Startup fetch failed / insufficient: "
-            f"{len(rates) if rates is not None else 0} bars"
+            f"[{broker_sym}] symbol_info returned None — "
+            f"symbol may not exist on this server.  "
+            f"MT5 error: {mt5.last_error()}"
         )
         return None
+
+    if not info.visible:
+        logger.info(f"[{broker_sym}] not visible — selecting...")
+        if not mt5.symbol_select(broker_sym, True):
+            logger.error(
+                f"[{broker_sym}] symbol_select failed.  "
+                f"MT5 error: {mt5.last_error()}"
+            )
+            return None
+        # Give terminal time to subscribe and receive history
+        time.sleep(3)
+        logger.info(f"[{broker_sym}] selected — waiting for data...")
+
+    # Step 2: try descending bar counts
+    attempts = [FETCH_BARS_STARTUP, 100_000, 50_000, 10_000, 5_000]
+    rates    = None
+    for n_bars in attempts:
+        rates = mt5.copy_rates_from_pos(
+            broker_sym, mt5.TIMEFRAME_M5, 0, n_bars + 1
+        )
+        if rates is not None and len(rates) >= WARMUP_M5 + ATR_PERIOD + 50:
+            logger.info(
+                f"[{broker_sym}] fetched {len(rates):,} bars "
+                f"(requested {n_bars:,})"
+            )
+            break
+        err = mt5.last_error()
+        logger.warning(
+            f"[{broker_sym}] fetch attempt {n_bars:,} bars → "
+            f"got {len(rates) if rates is not None else 0} bars  "
+            f"MT5 error: {err}"
+        )
+        time.sleep(1)
+    else:
+        logger.error(
+            f"[{broker_sym}] all fetch attempts failed.  "
+            f"Last MT5 error: {mt5.last_error()}"
+        )
+        return None
+
+    # Step 3: build DataFrame
     cols = ["time", "open", "high", "low", "close",
             "tick_volume", "spread", "real_volume"]
     df = pd.DataFrame(rates, columns=cols)[
@@ -311,6 +358,13 @@ def fetch_m5_full(broker_sym):
     df["utc_minute"] = df["time_utc"].dt.minute
     df["date"]       = df["time_utc"].dt.date
     df = df.iloc[:-1].reset_index(drop=True)   # drop live incomplete bar
+
+    logger.info(
+        f"[{broker_sym}] cache range: "
+        f"{df['time_utc'].iloc[0].strftime('%Y-%m-%d')} -> "
+        f"{df['time_utc'].iloc[-1].strftime('%Y-%m-%d')} "
+        f"({len(df):,} closed bars)"
+    )
     return df
 
 
