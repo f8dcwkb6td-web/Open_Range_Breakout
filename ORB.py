@@ -84,17 +84,12 @@ DAILY_LOSS_CAP_PCT = 0.0475
 DAILY_LOSS_BUDGET  = STARTING_BALANCE * DAILY_LOSS_CAP_PCT   # $1,187.50
 
 # ── Strategy constants ────────────────────────────────────────────────────────
-CACHE_MAX_BARS = 500_000
-MAX_HOLD       = 48
-ATR_PERIOD     = 14
-ATR_PCT_THRESH = 0.30
-WARMUP_M5      = 200
-
-# Chunked fetch settings
-FETCH_START_YEAR = 2019
-CHUNK_MONTHS     = 6
-CHUNK_SLEEP_S    = 0.4
-MAX_GAP_DAYS     = 14
+FETCH_BARS_STARTUP = 99_999    # bars to request at startup via copy_rates_from_pos
+CACHE_MAX_BARS     = 500_000
+MAX_HOLD           = 48
+ATR_PERIOD         = 14
+ATR_PCT_THRESH     = 0.30
+WARMUP_M5          = 200
 
 OR_BARS = {15: 3, 30: 6, 60: 12}
 
@@ -238,150 +233,20 @@ def expanding_pct_rank_update(hist, new_atr_val):
 
 
 # ==============================================================================
-#  SECTION 3 — STARTUP: CHUNKED DATE-RANGE FETCH + CACHE BUILD
+#  SECTION 3 — STARTUP: FETCH + CACHE BUILD
 # ==============================================================================
 
-def _add_months(dt: datetime.datetime, months: int) -> datetime.datetime:
-    """Advance a datetime by an integer number of months."""
-    m     = dt.month - 1 + months
-    year  = dt.year + m // 12
-    month = m % 12 + 1
-    days_in_month = [31, 28 + int(year % 4 == 0 and
-                     (year % 100 != 0 or year % 400 == 0)),
-                     31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    day = min(dt.day, days_in_month[month - 1])
-    return dt.replace(year=year, month=month, day=day)
-
-
-def fetch_m5_by_chunks(broker_sym: str):
+def fetch_m5_full(broker_sym):
     """
-    Fetch M5 bars from FETCH_START_YEAR-01-01 to now using CHUNK_MONTHS-wide
-    copy_rates_range windows.  Stitches, deduplicates on timestamp, drops the
-    live bar, trims to CACHE_MAX_BARS.
-
-    Returns DataFrame with columns:
-        time_utc, open, high, low, close, utc_hour, utc_minute, date
-    or None on failure.
-    """
-    chunk_start = datetime.datetime(FETCH_START_YEAR, 1, 1)   # naive UTC
-    now_utc     = datetime.datetime.utcnow()
-
-    all_chunks: list = []
-    chunk_idx = 0
-
-    logger.info(
-        f"[{broker_sym}] chunked fetch: "
-        f"{chunk_start.date()} -> {now_utc.date()} "
-        f"in {CHUNK_MONTHS}-month windows"
-    )
-
-    while chunk_start < now_utc:
-        chunk_end = min(_add_months(chunk_start, CHUNK_MONTHS), now_utc)
-
-        rates = mt5.copy_rates_range(
-            broker_sym, mt5.TIMEFRAME_M5, chunk_start, chunk_end
-        )
-        n_got = len(rates) if rates is not None else 0
-        err   = mt5.last_error()
-
-        if rates is None or n_got == 0:
-            logger.warning(
-                f"[{broker_sym}] chunk {chunk_idx:>2}: "
-                f"{chunk_start.date()} -> {chunk_end.date()} "
-                f"-> 0 bars  MT5 error: {err}"
-            )
-        else:
-            cols = ["time", "open", "high", "low", "close",
-                    "tick_volume", "spread", "real_volume"]
-            df_chunk = pd.DataFrame(rates, columns=cols)[
-                ["time", "open", "high", "low", "close"]
-            ].copy()
-            df_chunk["time_utc"] = pd.to_datetime(
-                df_chunk["time"].astype(np.int64), unit="s"
-            )
-            all_chunks.append(df_chunk)
-            logger.info(
-                f"[{broker_sym}] chunk {chunk_idx:>2}: "
-                f"{chunk_start.date()} -> {chunk_end.date()} "
-                f"-> {n_got:>7,} bars"
-            )
-
-        chunk_idx  += 1
-        chunk_start = chunk_end
-        time.sleep(CHUNK_SLEEP_S)
-
-    if not all_chunks:
-        logger.error(f"[{broker_sym}] all chunks empty — cannot build cache")
-        return None
-
-    # ── Stitch ────────────────────────────────────────────────────────────────
-    df = pd.concat(all_chunks, ignore_index=True)
-    df.sort_values("time_utc", inplace=True)
-
-    before = len(df)
-    df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
-    after  = len(df)
-    if before != after:
-        logger.info(
-            f"[{broker_sym}] dedup: {before:,} -> {after:,} bars "
-            f"({before - after:,} duplicates removed)"
-        )
-
-    df.reset_index(drop=True, inplace=True)
-
-    # ── Gap check ─────────────────────────────────────────────────────────────
-    diffs   = df["time_utc"].diff().dropna()
-    max_gap = diffs.max()
-    if pd.notna(max_gap) and max_gap > pd.Timedelta(days=MAX_GAP_DAYS):
-        gap_loc   = diffs.idxmax()
-        gap_start = df["time_utc"].iloc[gap_loc - 1]
-        gap_end   = df["time_utc"].iloc[gap_loc]
-        logger.warning(
-            f"[{broker_sym}] largest gap: {max_gap} "
-            f"between {gap_start} and {gap_end}"
-        )
-
-    # ── Derived columns ───────────────────────────────────────────────────────
-    df["utc_hour"]   = df["time_utc"].dt.hour
-    df["utc_minute"] = df["time_utc"].dt.minute
-    df["date"]       = df["time_utc"].dt.date
-
-    # Drop live incomplete bar
-    df = df.iloc[:-1].reset_index(drop=True)
-
-    # ── Trim to CACHE_MAX_BARS (keep newest) ──────────────────────────────────
-    if len(df) > CACHE_MAX_BARS:
-        logger.info(
-            f"[{broker_sym}] trimming {len(df):,} -> {CACHE_MAX_BARS:,} bars"
-        )
-        df = df.iloc[-CACHE_MAX_BARS:].reset_index(drop=True)
-
-    min_needed = WARMUP_M5 + ATR_PERIOD + 50
-    if len(df) < min_needed:
-        logger.error(
-            f"[{broker_sym}] only {len(df):,} bars — "
-            f"need at least {min_needed:,} — cannot trade"
-        )
-        return None
-
-    logger.info(
-        f"[{broker_sym}] final cache: "
-        f"{df['time_utc'].iloc[0].strftime('%Y-%m-%d')} -> "
-        f"{df['time_utc'].iloc[-1].strftime('%Y-%m-%d')} "
-        f"({len(df):,} closed bars)"
-    )
-    return df
-
-
-def fetch_m5_full(broker_sym: str):
-    """
-    Public entry point — ensures symbol visibility then delegates to
-    fetch_m5_by_chunks().  Return signature identical to original v4.
+    Fetch up to FETCH_BARS_STARTUP M5 bars at startup.
+    Drops the last (incomplete live) bar.
+    Trims result to CACHE_MAX_BARS rows (newest bars kept).
     """
     info = mt5.symbol_info(broker_sym)
     if info is None:
         logger.error(
             f"[{broker_sym}] symbol_info returned None — "
+            f"symbol may not exist on this server.  "
             f"MT5 error: {mt5.last_error()}"
         )
         return None
@@ -396,7 +261,94 @@ def fetch_m5_full(broker_sym: str):
             return None
         time.sleep(3)
 
-    return fetch_m5_by_chunks(broker_sym)
+    # Pre-warm: copy_rates_range forces broker to download full history
+    logger.info(f"[{broker_sym}] pre-warming history (copy_rates_range 2010->now)...")
+    seed_from = datetime.datetime(2010, 1, 1)
+    seed_to   = datetime.datetime.utcnow()
+    rates_probe = mt5.copy_rates_range(broker_sym, mt5.TIMEFRAME_M5, seed_from, seed_to)
+    n_probe = len(rates_probe) if rates_probe is not None else 0
+    logger.info(f"[{broker_sym}] pre-warm returned {n_probe:,} bars — sleeping 15s...")
+    time.sleep(15)
+
+    # Fetch with descending fallback counts
+    attempts = [FETCH_BARS_STARTUP, 500_000, 300_000, 200_000, 100_000, 50_000]
+    # Deduplicate while preserving order
+    seen = set()
+    attempts = [x for x in attempts if not (x in seen or seen.add(x))]
+    rates = None
+
+    for n_bars in attempts:
+        rates = mt5.copy_rates_from_pos(
+            broker_sym, mt5.TIMEFRAME_M5, 0, n_bars + 1
+        )
+        n_got = len(rates) if rates is not None else 0
+        err   = mt5.last_error()
+
+        if rates is not None and n_got >= WARMUP_M5 + ATR_PERIOD + 50:
+            oldest_ts = pd.Timestamp(rates[0]["time"], unit="s")
+            days_back = (pd.Timestamp.utcnow() - oldest_ts).days
+            logger.info(
+                f"[{broker_sym}] fetch {n_bars:,}: got {n_got:,} bars | "
+                f"oldest={oldest_ts.date()} ({days_back}d back)"
+            )
+            if n_got >= int(n_bars * 0.8):
+                break
+            else:
+                logger.warning(
+                    f"[{broker_sym}] only {n_got:,}/{n_bars:,} bars — "
+                    f"terminal still syncing? Waiting 10s and retrying..."
+                )
+                time.sleep(10)
+                rates2 = mt5.copy_rates_from_pos(
+                    broker_sym, mt5.TIMEFRAME_M5, 0, n_bars + 1
+                )
+                n_got2 = len(rates2) if rates2 is not None else 0
+                if rates2 is not None and n_got2 > n_got:
+                    rates = rates2
+                    logger.info(
+                        f"[{broker_sym}] retry gained {n_got2 - n_got:,} more bars "
+                        f"({n_got2:,} total)"
+                    )
+                break
+        else:
+            logger.warning(
+                f"[{broker_sym}] fetch attempt {n_bars:,} bars -> "
+                f"got {n_got} bars  MT5 error: {err}"
+            )
+            time.sleep(2)
+
+    if rates is None or len(rates) < WARMUP_M5 + ATR_PERIOD + 50:
+        logger.error(
+            f"[{broker_sym}] all fetch attempts failed.  "
+            f"Last MT5 error: {mt5.last_error()}"
+        )
+        return None
+
+    cols = ["time", "open", "high", "low", "close",
+            "tick_volume", "spread", "real_volume"]
+    df = pd.DataFrame(rates, columns=cols)[
+        ["time", "open", "high", "low", "close"]
+    ].copy()
+    df["time_utc"]   = pd.to_datetime(df["time"].astype(np.int64), unit="s")
+    df["utc_hour"]   = df["time_utc"].dt.hour
+    df["utc_minute"] = df["time_utc"].dt.minute
+    df["date"]       = df["time_utc"].dt.date
+    df = df.iloc[:-1].reset_index(drop=True)   # drop live incomplete bar
+
+    if len(df) > CACHE_MAX_BARS:
+        logger.info(
+            f"[{broker_sym}] trimming {len(df):,} -> {CACHE_MAX_BARS:,} bars "
+            f"(keeping newest)"
+        )
+        df = df.iloc[-CACHE_MAX_BARS:].reset_index(drop=True)
+
+    logger.info(
+        f"[{broker_sym}] cache range: "
+        f"{df['time_utc'].iloc[0].strftime('%Y-%m-%d')} -> "
+        f"{df['time_utc'].iloc[-1].strftime('%Y-%m-%d')} "
+        f"({len(df):,} closed bars)"
+    )
+    return df
 
 
 def build_bar_cache(canon, df):
@@ -1262,15 +1214,14 @@ def run_live():
         mt5.shutdown()
         return
 
-    # ── Startup fetch — chunked copy_rates_range from 2019 ───────────────────
+    # ── Startup fetch ─────────────────────────────────────────────────────────
     logger.info(
-        f"\n=== STARTUP FETCH (chunked copy_rates_range, "
-        f"{FETCH_START_YEAR}-01-01 -> now, "
-        f"{CHUNK_MONTHS}-month windows, cap {CACHE_MAX_BARS:,}) ==="
+        f"\n=== STARTUP FETCH (target {FETCH_BARS_STARTUP:,} bars, "
+        f"cap {CACHE_MAX_BARS:,}) ==="
     )
     for canon in active_symbols:
         broker = sym_map[canon]
-        logger.info(f"  [{canon}] starting chunked fetch...")
+        logger.info(f"  [{canon}] fetching up to {FETCH_BARS_STARTUP:,} bars...")
         df = fetch_m5_full(broker)
         if df is None:
             logger.error(
@@ -1326,8 +1277,7 @@ def run_live():
         f"ATR_PCT_THRESH={ATR_PCT_THRESH}  WARMUP={WARMUP_M5}bars  "
         f"MAX_RISK_MULTIPLE={MAX_RISK_MULTIPLE}x  "
         f"CACHE_MAX_BARS={CACHE_MAX_BARS:,}  "
-        f"FETCH_START_YEAR={FETCH_START_YEAR}  "
-        f"CHUNK_MONTHS={CHUNK_MONTHS}"
+        f"FETCH_BARS_STARTUP={FETCH_BARS_STARTUP:,}"
     )
     logger.info("=== END PARAMS ===\n")
 
