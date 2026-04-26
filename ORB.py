@@ -445,17 +445,17 @@ def build_bar_cache(canon, df):
 
 def fetch_latest_closed_bar(broker_sym):
     """
-    Fetch the 2 most recent bars; return the last closed one (index 1).
-    copy_rates_from_pos(sym, tf, 0, 2) -> [live_bar, prev_closed]
-    Wait — actually: pos=0 = most recent. With count=2:
-      rates[0] = most recent (could still be forming)
-      rates[1] = one before that (definitely closed)
-    We want rates[1].
+    Fetch the most recent closed bar.
+    copy_rates_from_pos(sym, tf, 0, 2) returns bars newest-first:
+      rates[0] = most recent closed bar (the one we want)
+      rates[1] = the bar before that
+    The duplicate guard in append_bar_to_cache() prevents acting on a
+    bar that is still forming — if bar_time <= last_bar_time it is skipped.
     """
     rates = mt5.copy_rates_from_pos(broker_sym, mt5.TIMEFRAME_M5, 0, 2)
     if rates is None or len(rates) < 2:
         return None
-    r = rates[1]   # rates[1] is the last fully closed bar
+    r = rates[0]
     t = pd.Timestamp(r["time"], unit="s")
     return t, float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"])
 
@@ -1100,7 +1100,7 @@ def get_last_closed_bar_time():
         return None
     rates = mt5.copy_rates_from_pos(_CLOCK_SYM_BROKER, mt5.TIMEFRAME_M5, 0, 2)
     if rates is not None and len(rates) >= 2:
-        return pd.Timestamp(rates[1]["time"], unit="s")
+        return pd.Timestamp(rates[0]["time"], unit="s")
     return None
 
 
@@ -1109,7 +1109,7 @@ def wait_for_new_bar(last_bar_time):
         t = get_last_closed_bar_time()
         if t is not None and t > last_bar_time:
             return t
-        time.sleep(10)
+        time.sleep(1)
 
 
 # ==============================================================================
