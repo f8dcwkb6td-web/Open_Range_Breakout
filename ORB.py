@@ -1,3 +1,6 @@
+import sys
+print("SCRIPT STARTED", flush=True)
+sys.stdout.flush()
 """
 ==============================================================================
 ORB  —  OPENING RANGE BREAKOUT  |  LIVE ENGINE v4  (M5)
@@ -82,9 +85,7 @@ _sh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.addHandler(_sh)
 
 # ── MT5 connection ────────────────────────────────────────────────────────────
-TERMINAL_PATH = os.environ.get(
-    "MT5_TERMINAL_PATH", r"C:\Program Files\MetaTrader 5\terminal64.exe"
-)
+TERMINAL_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 LOGIN    = 1513214612
 PASSWORD = "h2QE?*1!v5fQ"
 SERVER   = "FTMO-Demo"
@@ -1270,16 +1271,21 @@ def run_live():
     global _CLOCK_SYM_BROKER, _MAX_TRADES_DAY_COMBO
     print("run_live() started", flush=True)
 
-    if not mt5.initialize(path=TERMINAL_PATH):
-        print(f"MT5 initialize failed: {mt5.last_error()}")
-        raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
+    print("Waiting for MT5 terminal to be ready...", flush=True)
+    for _attempt in range(30):
+        init_ok = mt5.initialize()
+        err = mt5.last_error()
+        print(f"  attempt {_attempt+1}/30: init={init_ok} error={err}", flush=True)
+        if init_ok:
+            break
+        time.sleep(3)
+    else:
+        raise RuntimeError("MT5 terminal did not respond after 90s")
 
-    print(f"MT5 initialize OK — last_error={mt5.last_error()}")
-
+    print("MT5 initialized — logging in...", flush=True)
     authorized = mt5.login(LOGIN, PASSWORD, SERVER)
-    print(f"Login result: {authorized}")
-    print(f"last_error after login: {mt5.last_error()}")
-    print(f"account_info: {mt5.account_info()}")
+    print(f"Login result: {authorized} error={mt5.last_error()}", flush=True)
+    print(f"account_info: {mt5.account_info()}", flush=True)
 
     if not authorized:
         mt5.shutdown()
