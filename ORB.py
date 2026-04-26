@@ -84,8 +84,8 @@ DAILY_LOSS_CAP_PCT = 0.0475
 DAILY_LOSS_BUDGET  = STARTING_BALANCE * DAILY_LOSS_CAP_PCT   # $1,187.50
 
 # ── Strategy constants ────────────────────────────────────────────────────────
-FETCH_BARS_STARTUP = 50000   # bars to request at startup via copy_rates_from_pos
-CACHE_MAX_BARS     = 200000
+FETCH_BARS_STARTUP = 99_999    # bars to request at startup via copy_rates_from_pos
+CACHE_MAX_BARS     = 500_000
 MAX_HOLD           = 48
 ATR_PERIOD         = 14
 ATR_PCT_THRESH     = 0.30
@@ -233,8 +233,191 @@ def expanding_pct_rank_update(hist, new_atr_val):
 
 
 # ==============================================================================
-#  SECTION 3 — STARTUP: FETCH + CACHE BUILD
+#  SECTION 3 — STARTUP: CSV + GAP FILL  (falls back to broker fetch if no CSV)
 # ==============================================================================
+
+# CSV files must sit in the same folder as this script.
+# Required columns (any order, case-insensitive): time, open, high, low, close
+# 'time' column must be unix timestamp in seconds (UTC) — same format MT5 exports.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_FILES = {
+    "US30":  os.path.join(SCRIPT_DIR, "US30.cash.csv"),
+    "GER40": os.path.join(SCRIPT_DIR, "GER40.cash.csv"),
+}
+
+
+def _df_add_derived_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add utc_hour, utc_minute, date from time_utc.
+    time_utc must already be a naive UTC datetime64 column —
+    identical to what pd.to_datetime(..., unit='s') produces from MT5 data.
+    No tz conversion is done here; .dt.hour/.dt.minute/.dt.date work on
+    naive datetimes and return UTC values as long as the source is UTC.
+    """
+    df["utc_hour"]   = df["time_utc"].dt.hour
+    df["utc_minute"] = df["time_utc"].dt.minute
+    df["date"]       = df["time_utc"].dt.date
+    return df
+
+
+def _parse_csv(csv_path: str) -> pd.DataFrame:
+    """
+    Read an MT5-exported M5 CSV.
+    'time' column must be unix timestamp (seconds, UTC) — the default
+    MT5 export format.  Produces naive UTC datetime64, identical to
+    pd.to_datetime(rates['time'], unit='s').
+    """
+    df = pd.read_csv(csv_path)
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # Parse time — unix seconds → naive UTC datetime64 (no tz info)
+    # This matches exactly how the broker fetch builds time_utc.
+    if pd.api.types.is_numeric_dtype(df["time"]):
+        df["time_utc"] = pd.to_datetime(df["time"].astype(np.int64), unit="s")
+    else:
+        # String timestamps — strip any tz info to keep naive UTC
+        df["time_utc"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
+
+    df = df[["time_utc", "open", "high", "low", "close"]].copy()
+    df["open"]  = df["open"].astype(np.float64)
+    df["high"]  = df["high"].astype(np.float64)
+    df["low"]   = df["low"].astype(np.float64)
+    df["close"] = df["close"].astype(np.float64)
+
+    df.sort_values("time_utc", inplace=True)
+    df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    df = _df_add_derived_cols(df)
+    return df
+
+
+def _fetch_gap_df(broker_sym: str, from_dt: datetime.datetime) -> pd.DataFrame:
+    """
+    Fetch bars from_dt → now via copy_rates_range and return a processed
+    DataFrame matching the same column layout as the broker fetch path.
+    from_dt is naive UTC (no tzinfo) — same convention as datetime.datetime.utcnow().
+    """
+    to_dt = datetime.datetime.utcnow()
+    logger.info(
+        f"[{broker_sym}] gap fetch: "
+        f"{from_dt.strftime('%Y-%m-%d %H:%M')} UTC -> now"
+    )
+    rates = mt5.copy_rates_range(broker_sym, mt5.TIMEFRAME_M5, from_dt, to_dt)
+    if rates is None or len(rates) == 0:
+        logger.warning(
+            f"[{broker_sym}] gap fetch returned 0 bars  "
+            f"MT5 error: {mt5.last_error()}"
+        )
+        return pd.DataFrame()
+
+    cols = ["time", "open", "high", "low", "close",
+            "tick_volume", "spread", "real_volume"]
+    df = pd.DataFrame(rates, columns=cols)[
+        ["time", "open", "high", "low", "close"]
+    ].copy()
+    # Naive UTC — identical to the main broker fetch path
+    df["time_utc"] = pd.to_datetime(df["time"].astype(np.int64), unit="s")
+    df.drop(columns=["time"], inplace=True)
+    df.sort_values("time_utc", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    df = _df_add_derived_cols(df)
+    logger.info(f"[{broker_sym}] gap fetch: {len(df):,} bars received")
+    return df
+
+
+def _finalise_df(df: pd.DataFrame, broker_sym: str):
+    """
+    Shared post-processing for any assembled DataFrame:
+      - Drop the last bar (may be live / incomplete)
+      - Trim to CACHE_MAX_BARS (keep newest)
+      - Minimum viability check
+    Returns processed DataFrame or None.
+    """
+    df = df.iloc[:-1].reset_index(drop=True)   # drop live/incomplete bar
+
+    if len(df) > CACHE_MAX_BARS:
+        logger.info(
+            f"[{broker_sym}] trimming {len(df):,} -> {CACHE_MAX_BARS:,} bars "
+            f"(keeping newest)"
+        )
+        df = df.iloc[-CACHE_MAX_BARS:].reset_index(drop=True)
+
+    min_needed = WARMUP_M5 + ATR_PERIOD + 50
+    if len(df) < min_needed:
+        logger.error(
+            f"[{broker_sym}] only {len(df):,} bars after assembly — "
+            f"need at least {min_needed:,} — cannot trade"
+        )
+        return None
+
+    logger.info(
+        f"[{broker_sym}] cache range: "
+        f"{df['time_utc'].iloc[0].strftime('%Y-%m-%d')} -> "
+        f"{df['time_utc'].iloc[-1].strftime('%Y-%m-%d %H:%M')} "
+        f"({len(df):,} closed bars)"
+    )
+    return df
+
+
+def load_csv_or_fetch(canon: str, broker_sym: str):
+    """
+    PATH A — CSV exists:
+      1. Parse CSV (naive UTC, identical to broker fetch output)
+      2. Fetch only the gap from csv_last_bar → now via copy_rates_range
+      3. Concat + deduplicate on time_utc + finalise
+
+    PATH B — no CSV:
+      Fallback to the original copy_rates_from_pos with descending count
+      attempts and pre-warm sleep (unchanged from original v4).
+    """
+    csv_path = CSV_FILES.get(canon, "")
+
+    # ── PATH A: CSV ───────────────────────────────────────────────────────────
+    if csv_path and os.path.isfile(csv_path):
+        logger.info(f"[{canon}] loading CSV: {csv_path}")
+        try:
+            csv_df = _parse_csv(csv_path)
+        except Exception as e:
+            logger.error(f"[{canon}] CSV parse error: {e} — falling back to broker fetch")
+            csv_df = None
+
+        if csv_df is not None and len(csv_df) > 0:
+            csv_last = csv_df["time_utc"].iloc[-1]
+            logger.info(
+                f"[{canon}] CSV: {len(csv_df):,} bars  "
+                f"{csv_df['time_utc'].iloc[0].strftime('%Y-%m-%d')} -> "
+                f"{csv_last.strftime('%Y-%m-%d %H:%M')} UTC"
+            )
+
+            # gap_from is naive UTC — same convention as datetime.utcnow()
+            gap_from = csv_last.to_pydatetime()   # naive UTC, no tzinfo
+            gap_df   = _fetch_gap_df(broker_sym, gap_from)
+
+            if len(gap_df) > 0:
+                combined = pd.concat([csv_df, gap_df], ignore_index=True)
+                combined.sort_values("time_utc", inplace=True)
+                combined.drop_duplicates(subset="time_utc", keep="last", inplace=True)
+                combined.reset_index(drop=True, inplace=True)
+                logger.info(
+                    f"[{canon}] assembled: {len(csv_df):,} CSV + "
+                    f"{len(gap_df):,} gap = {len(combined):,} bars"
+                )
+            else:
+                combined = csv_df.copy()
+                logger.info(f"[{canon}] no gap bars — using CSV only ({len(combined):,} bars)")
+
+            return _finalise_df(combined, broker_sym)
+
+        # CSV parsed but empty — fall through to broker fetch
+        logger.warning(f"[{canon}] CSV was empty — falling back to broker fetch")
+
+    # ── PATH B: broker fallback ───────────────────────────────────────────────
+    logger.info(
+        f"[{canon}] no CSV at '{csv_path}' — "
+        f"using broker fetch (target {FETCH_BARS_STARTUP:,} bars)"
+    )
+    return fetch_m5_full(broker_sym)
+
 
 def fetch_m5_full(broker_sym):
     """
@@ -271,7 +454,7 @@ def fetch_m5_full(broker_sym):
     time.sleep(15)
 
     # Fetch with descending fallback counts
-    attempts = [FETCH_BARS_STARTUP, 200_000, 100_000, 50_000]
+    attempts = [FETCH_BARS_STARTUP, 500_000, 300_000, 200_000, 100_000, 50_000]
     # Deduplicate while preserving order
     seen = set()
     attempts = [x for x in attempts if not (x in seen or seen.add(x))]
@@ -1214,23 +1397,30 @@ def run_live():
         mt5.shutdown()
         return
 
-    # ── Startup fetch ─────────────────────────────────────────────────────────
+    # ── Startup: CSV + gap fill, or broker fallback ───────────────────────────
     logger.info(
-        f"\n=== STARTUP FETCH (target {FETCH_BARS_STARTUP:,} bars, "
+        f"\n=== STARTUP DATA LOAD (CSV+gap or broker fetch, "
         f"cap {CACHE_MAX_BARS:,}) ==="
     )
-    for canon in active_symbols:
-        broker = sym_map[canon]
-        logger.info(f"  [{canon}] fetching up to {FETCH_BARS_STARTUP:,} bars...")
-        df = fetch_m5_full(broker)
+    for canon in active_symbols[:]:   # iterate a copy so removals are safe
+        broker   = sym_map[canon]
+        csv_path = CSV_FILES.get(canon, "")
+        if os.path.isfile(csv_path):
+            logger.info(f"  [{canon}] CSV found: {csv_path}")
+        else:
+            logger.info(
+                f"  [{canon}] no CSV — broker fetch fallback "
+                f"(target {FETCH_BARS_STARTUP:,} bars)"
+            )
+        df = load_csv_or_fetch(canon, broker)
         if df is None:
             logger.error(
-                f"  [{canon}] startup fetch failed — cannot trade this symbol"
+                f"  [{canon}] data load failed — removing from active symbols"
             )
-            active_symbols = [s for s in active_symbols if s != canon]
+            active_symbols.remove(canon)
             continue
         build_bar_cache(canon, df)
-    logger.info("=== END STARTUP FETCH ===\n")
+    logger.info("=== END DATA LOAD ===\n")
 
     if not active_symbols:
         logger.error("No symbols with data — shutting down")
