@@ -1275,7 +1275,7 @@ def run_live():
 
     print(f"MT5 initialize OK — last_error={mt5.last_error()}")
 
-    authorized = mt5.login(LOGIN, password=PASSWORD, server=SERVER)
+    authorized = mt5.login(LOGIN, PASSWORD, SERVER)
     print(f"Login result: {authorized}")
     print(f"last_error after login: {mt5.last_error()}")
     print(f"account_info: {mt5.account_info()}")
