@@ -102,7 +102,7 @@ DAILY_LOSS_CAP_PCT = 0.0475
 DAILY_LOSS_BUDGET  = STARTING_BALANCE * DAILY_LOSS_CAP_PCT   # $1,187.50
 
 # ── Strategy constants ────────────────────────────────────────────────────────
-FETCH_BARS_STARTUP = 500_000   # full history fetch at startup
+FETCH_BARS_STARTUP = 250_000   # full history fetch at startup
 MAX_HOLD           = 48
 ATR_PERIOD         = 14
 ATR_PCT_THRESH     = 0.30
