@@ -262,28 +262,65 @@ def _df_add_derived_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 def _parse_csv(csv_path: str) -> pd.DataFrame:
     """
-    Read an MT5-exported M5 CSV.
-    'time' column must be unix timestamp (seconds, UTC) — the default
-    MT5 export format.  Produces naive UTC datetime64, identical to
-    pd.to_datetime(rates['time'], unit='s').
+    Read an MT5-exported M5 CSV.  Handles all common MT5 export formats:
+      - Unix timestamp in seconds  (numeric)
+      - "2024.01.02 13:30"         (MT5 default string, dot-separated date)
+      - "2024-01-02 13:30"         (ISO-style string)
+      - Any tz-aware string        (tz info stripped, kept as naive UTC)
+
+    MT5 sometimes exports date and time as two separate columns (<DATE>
+    and <TIME>).  If no single 'time' column exists we combine them.
+
+    Always produces naive UTC datetime64 — identical to what
+    pd.to_datetime(rates['time'], unit='s') produces from broker data.
     """
     df = pd.read_csv(csv_path)
-    df.columns = [c.strip().lower() for c in df.columns]
+    # Normalise column names: strip whitespace, lowercase, remove < >
+    df.columns = [c.strip().lower().replace("<", "").replace(">", "")
+                  for c in df.columns]
 
-    # Parse time — unix seconds → naive UTC datetime64 (no tz info)
-    # This matches exactly how the broker fetch builds time_utc.
+    # ── Locate / assemble the time column ────────────────────────────────────
+    if "time" not in df.columns:
+        date_col = next((c for c in df.columns if "date" in c), None)
+        time_col = next((c for c in df.columns
+                         if "time" in c and c != date_col), None)
+        if date_col and time_col:
+            df["time"] = df[date_col].astype(str) + " " + df[time_col].astype(str)
+            logger.info(f"  CSV: combined '{date_col}' + '{time_col}' -> 'time'")
+        else:
+            raise ValueError(
+                f"CSV has no 'time' column and no date+time pair. "
+                f"Columns found: {list(df.columns)}"
+            )
+
+    # ── Parse time → naive UTC datetime64 ────────────────────────────────────
     if pd.api.types.is_numeric_dtype(df["time"]):
+        # Unix seconds — identical to broker fetch path
         df["time_utc"] = pd.to_datetime(df["time"].astype(np.int64), unit="s")
     else:
-        # String timestamps — strip any tz info to keep naive UTC
-        df["time_utc"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
+        sample = str(df["time"].iloc[0]).strip()
+        if "." in sample.split(" ")[0]:
+            # MT5 default: "2024.01.02 13:30" — swap dots in date part to dashes
+            fixed = df["time"].astype(str).str.replace(
+                r"(\d{4})\.(\d{2})\.(\d{2})",
+                lambda m: f"{m.group(1)}-{m.group(2)}-{m.group(3)}",
+                regex=True
+            )
+            df["time_utc"] = pd.to_datetime(fixed)
+        else:
+            df["time_utc"] = pd.to_datetime(df["time"].astype(str))
+
+        # Strip tz if present → naive UTC
+        if hasattr(df["time_utc"].dt, "tz") and df["time_utc"].dt.tz is not None:
+            df["time_utc"] = df["time_utc"].dt.tz_convert("UTC").dt.tz_localize(None)
 
     df = df[["time_utc", "open", "high", "low", "close"]].copy()
-    df["open"]  = df["open"].astype(np.float64)
-    df["high"]  = df["high"].astype(np.float64)
-    df["low"]   = df["low"].astype(np.float64)
-    df["close"] = df["close"].astype(np.float64)
+    df["open"]  = pd.to_numeric(df["open"],  errors="coerce").astype(np.float64)
+    df["high"]  = pd.to_numeric(df["high"],  errors="coerce").astype(np.float64)
+    df["low"]   = pd.to_numeric(df["low"],   errors="coerce").astype(np.float64)
+    df["close"] = pd.to_numeric(df["close"], errors="coerce").astype(np.float64)
 
+    df.dropna(inplace=True)
     df.sort_values("time_utc", inplace=True)
     df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
     df.reset_index(drop=True, inplace=True)
