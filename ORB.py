@@ -271,7 +271,7 @@ def fetch_m5_full(broker_sym):
     time.sleep(15)
 
     # Fetch with descending fallback counts
-    attempts = [FETCH_BARS_STARTUP, 500_000, 300_000, 200_000, 100_000, 50_000]
+    attempts = [FETCH_BARS_STARTUP, 200_000, 100_000, 50_000]
     # Deduplicate while preserving order
     seen = set()
     attempts = [x for x in attempts if not (x in seen or seen.add(x))]
