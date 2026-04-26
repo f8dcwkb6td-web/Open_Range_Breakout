@@ -1268,6 +1268,7 @@ def _process_symbol_safe(canon, broker, sym_st, params, balance):
 
 def run_live():
     global _CLOCK_SYM_BROKER, _MAX_TRADES_DAY_COMBO
+    print("run_live() started", flush=True)
 
     if not mt5.initialize(path=TERMINAL_PATH):
         print(f"MT5 initialize failed: {mt5.last_error()}")
