@@ -586,22 +586,31 @@ def append_bar_to_cache(canon, bar_time, o, h, l, c):
 
 def fill_gap_for_symbol(canon: str, broker_sym: str) -> int:
     """
-    Fetch every bar between cache["last_bar_time"] and now via
+    Fetch every CLOSED bar between cache["last_bar_time"] and now via
     copy_rates_range, then append each one in chronological order using
     append_bar_to_cache (which calls atr_wilder_update per bar).
 
+    KEY FIXES vs previous version:
+      - from_dt is nudged +1s so copy_rates_range does not re-return the
+        already-cached bar (the API is inclusive on from_dt).
+      - The "live bar" is identified by comparing its open time to
+        (now - 5 min), NOT by blindly dropping iloc[-1].  This means a
+        freshly-closed bar is never discarded.
+      - Every single-bar append is logged, not just multi-bar fills.
+
     Returns number of new bars appended.
-    Handles weekend gaps transparently — no special-case code needed.
     """
-    cache    = _bar_cache[canon]
-    from_dt  = cache["last_bar_time"].to_pydatetime()   # naive UTC
-    to_dt    = datetime.datetime.utcnow()
+    cache   = _bar_cache[canon]
+    now_utc = datetime.datetime.utcnow()
+
+    # +1 second so the inclusive range doesn't re-fetch the cached bar
+    from_dt = cache["last_bar_time"].to_pydatetime() + datetime.timedelta(seconds=1)
+    to_dt   = now_utc
 
     rates = mt5.copy_rates_range(broker_sym, mt5.TIMEFRAME_M5, from_dt, to_dt)
     if rates is None or len(rates) == 0:
         return 0
 
-    # Build a quick DataFrame just for sorting / dedup
     cols = ["time", "open", "high", "low", "close",
             "tick_volume", "spread", "real_volume"]
     df = pd.DataFrame(rates, columns=cols)[["time", "open", "high", "low", "close"]].copy()
@@ -610,23 +619,28 @@ def fill_gap_for_symbol(canon: str, broker_sym: str) -> int:
     df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    # Drop the last row — it may still be forming (live bar)
-    if len(df) > 1:
-        df = df.iloc[:-1]
-    elif len(df) == 1:
-        return 0   # only the live bar, nothing closed yet
+    # The live/forming bar has an open time within the last 5 minutes.
+    # Drop it; every bar older than that is already closed.
+    live_cutoff = pd.Timestamp(now_utc) - pd.Timedelta(minutes=5)
+    df = df[df["time_utc"] <= live_cutoff].copy()
 
-    appended = 0
+    if len(df) == 0:
+        return 0
+
+    appended   = 0
     gap_warned = False
+
     for row in df.itertuples(index=False):
         bar_time = pd.Timestamp(row.time_utc)
-        # Warn once if the gap is larger than one normal bar (>5 min)
+
+        # Warn once at the start of any gap larger than one bar
         if not gap_warned and appended == 0:
-            expected_gap = bar_time - cache["last_bar_time"]
-            if expected_gap > pd.Timedelta(minutes=6):
+            gap = bar_time - cache["last_bar_time"]
+            if gap > pd.Timedelta(minutes=6):
                 logger.warning(
-                    f"[{canon}] GAP DETECTED: {expected_gap} "
-                    f"(last={cache['last_bar_time']} new={bar_time}) — filling..."
+                    f"[{canon}] GAP DETECTED: {gap} "
+                    f"(cache_end={cache['last_bar_time']} "
+                    f"first_new={bar_time}) — filling {len(df)} bars..."
                 )
                 gap_warned = True
 
@@ -638,8 +652,12 @@ def fill_gap_for_symbol(canon: str, broker_sym: str) -> int:
         if added:
             appended += 1
 
-    if appended > 1:
-        logger.info(f"[{canon}] gap fill: {appended} bars appended")
+    # Log every fill — single bar or many
+    if appended > 0:
+        logger.info(
+            f"[{canon}] gap fill: {appended} bar(s) appended  "
+            f"cache now ends {cache['last_bar_time']} UTC"
+        )
 
     return appended
 
