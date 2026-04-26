@@ -301,8 +301,8 @@ def _prewarm_history(broker_sym):
     inside the terminal; we sleep after to let it complete before the real
     fetch.
     """
-    seed_from = datetime.datetime(2010, 1, 1, tzinfo=datetime.timezone.utc)
-    seed_to   = datetime.datetime.now(datetime.timezone.utc)
+    seed_from = datetime.datetime(2010, 1, 1)   # naive UTC — MT5 requires no tzinfo
+    seed_to   = datetime.datetime.utcnow()
     rates = mt5.copy_rates_range(broker_sym, mt5.TIMEFRAME_M5, seed_from, seed_to)
     n_probe = len(rates) if rates is not None else 0
     logger.info(
@@ -1338,8 +1338,8 @@ def run_live():
     logger.info(
         f"\n=== HISTORY PRE-WARM (copy_rates_range 2010→now, all symbols) ==="
     )
-    seed_from = datetime.datetime(2010, 1, 1, tzinfo=datetime.timezone.utc)
-    seed_to   = datetime.datetime.now(datetime.timezone.utc)
+    seed_from = datetime.datetime(2010, 1, 1)   # naive UTC — MT5 requires no tzinfo
+    seed_to   = datetime.datetime.utcnow()
     for canon in active_symbols:
         broker = sym_map[canon]
         rates_probe = mt5.copy_rates_range(
