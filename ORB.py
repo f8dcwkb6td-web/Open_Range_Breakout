@@ -262,57 +262,83 @@ def _df_add_derived_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 def _parse_csv(csv_path: str) -> pd.DataFrame:
     """
-    Read an MT5-exported M5 CSV.  Handles all common MT5 export formats:
-      - Unix timestamp in seconds  (numeric)
-      - "2024.01.02 13:30"         (MT5 default string, dot-separated date)
-      - "2024-01-02 13:30"         (ISO-style string)
-      - Any tz-aware string        (tz info stripped, kept as naive UTC)
-
-    MT5 sometimes exports date and time as two separate columns (<DATE>
-    and <TIME>).  If no single 'time' column exists we combine them.
-
-    Always produces naive UTC datetime64 — identical to what
-    pd.to_datetime(rates['time'], unit='s') produces from broker data.
+    Read an MT5-exported M5 CSV.
+    Handles tab-separated or comma-separated files.
+    MT5 exports columns like: date, time, open, high, low, close, tickvol, vol, spread
+    — sometimes with a leading tab that makes pandas read them as "tdate", "ttime" etc.
+    Strips the leading "t" prefix from column names, combines date+time into time_utc,
+    and produces naive UTC datetime64 identical to pd.to_datetime(rates["time"], unit="s").
     """
-    df = pd.read_csv(csv_path)
-    # Normalise column names: strip whitespace, lowercase, remove < >
-    df.columns = [c.strip().lower().replace("<", "").replace(">", "")
-                  for c in df.columns]
+    # Try tab-separated first (MT5 default), fall back to comma
+    try:
+        df = pd.read_csv(csv_path, sep="\t")
+        if len(df.columns) < 4:
+            df = pd.read_csv(csv_path)
+    except Exception:
+        df = pd.read_csv(csv_path)
 
-    # ── Locate / assemble the time column ────────────────────────────────────
-    if "time" not in df.columns:
-        date_col = next((c for c in df.columns if "date" in c), None)
-        time_col = next((c for c in df.columns
-                         if "time" in c and c != date_col), None)
-        if date_col and time_col:
-            df["time"] = df[date_col].astype(str) + " " + df[time_col].astype(str)
-            logger.info(f"  CSV: combined '{date_col}' + '{time_col}' -> 'time'")
+    # Normalise column names: strip whitespace, <>, lowercase,
+    # and strip a leading "t" prefix that MT5 tab exports produce
+    def _clean_col(c):
+        c = c.strip().lower().replace("<", "").replace(">", "")
+        if c.startswith("t") and c[1:] in (
+            "date", "time", "open", "high", "low", "close",
+            "tickvol", "vol", "spread"
+        ):
+            c = c[1:]
+        return c
+
+    df.columns = [_clean_col(c) for c in df.columns]
+
+    # ── Assemble time_utc ─────────────────────────────────────────────────────
+    if "date" in df.columns and "time" in df.columns:
+        # MT5 standard: separate date "2024.01.02" and time "13:30" columns
+        combined = df["date"].astype(str).str.strip() + " " + df["time"].astype(str).str.strip()
+        # Replace dots in date part with dashes: "2024.01.02" -> "2024-01-02"
+        fixed = combined.str.replace(
+            r"(\d{4})\.(\d{2})\.(\d{2})",
+            lambda m: f"{m.group(1)}-{m.group(2)}-{m.group(3)}",
+            regex=True
+        )
+        df["time_utc"] = pd.to_datetime(fixed)
+        logger.info(f"  CSV: combined date+time columns, first bar: {df['time_utc'].iloc[0]}")
+
+    elif "time" in df.columns:
+        if pd.api.types.is_numeric_dtype(df["time"]):
+            # Unix seconds — identical to broker fetch
+            df["time_utc"] = pd.to_datetime(df["time"].astype(np.int64), unit="s")
         else:
-            raise ValueError(
-                f"CSV has no 'time' column and no date+time pair. "
-                f"Columns found: {list(df.columns)}"
-            )
-
-    # ── Parse time → naive UTC datetime64 ────────────────────────────────────
-    if pd.api.types.is_numeric_dtype(df["time"]):
-        # Unix seconds — identical to broker fetch path
-        df["time_utc"] = pd.to_datetime(df["time"].astype(np.int64), unit="s")
-    else:
-        sample = str(df["time"].iloc[0]).strip()
-        if "." in sample.split(" ")[0]:
-            # MT5 default: "2024.01.02 13:30" — swap dots in date part to dashes
-            fixed = df["time"].astype(str).str.replace(
-                r"(\d{4})\.(\d{2})\.(\d{2})",
-                lambda m: f"{m.group(1)}-{m.group(2)}-{m.group(3)}",
-                regex=True
-            )
-            df["time_utc"] = pd.to_datetime(fixed)
-        else:
-            df["time_utc"] = pd.to_datetime(df["time"].astype(str))
-
-        # Strip tz if present → naive UTC
+            sample = str(df["time"].iloc[0]).strip()
+            if "." in sample.split(" ")[0]:
+                fixed = df["time"].astype(str).str.replace(
+                    r"(\d{4})\.(\d{2})\.(\d{2})",
+                    lambda m: f"{m.group(1)}-{m.group(2)}-{m.group(3)}",
+                    regex=True
+                )
+                df["time_utc"] = pd.to_datetime(fixed)
+            else:
+                df["time_utc"] = pd.to_datetime(df["time"].astype(str))
+        # Strip tz if present -> naive UTC
         if hasattr(df["time_utc"].dt, "tz") and df["time_utc"].dt.tz is not None:
             df["time_utc"] = df["time_utc"].dt.tz_convert("UTC").dt.tz_localize(None)
+    else:
+        raise ValueError(
+            f"CSV has no usable time column. Columns found: {list(df.columns)}"
+        )
+
+    # ── OHLC ─────────────────────────────────────────────────────────────────
+    df = df[["time_utc", "open", "high", "low", "close"]].copy()
+    df["open"]  = pd.to_numeric(df["open"],  errors="coerce").astype(np.float64)
+    df["high"]  = pd.to_numeric(df["high"],  errors="coerce").astype(np.float64)
+    df["low"]   = pd.to_numeric(df["low"],   errors="coerce").astype(np.float64)
+    df["close"] = pd.to_numeric(df["close"], errors="coerce").astype(np.float64)
+
+    df.dropna(inplace=True)
+    df.sort_values("time_utc", inplace=True)
+    df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    df = _df_add_derived_cols(df)
+    return df
 
     df = df[["time_utc", "open", "high", "low", "close"]].copy()
     df["open"]  = pd.to_numeric(df["open"],  errors="coerce").astype(np.float64)
@@ -511,25 +537,14 @@ def fetch_m5_full(broker_sym):
                 f"[{broker_sym}] fetch {n_bars:,}: got {n_got:,} bars | "
                 f"oldest={oldest_ts.date()} ({days_back}d back)"
             )
-            if n_got >= int(n_bars * 0.8):
-                break
-            else:
+            # Accept whatever we got — don't discard a 496k result
+            # just because it didn't hit the 80% threshold of 500k
+            if n_got < int(n_bars * 0.8):
                 logger.warning(
-                    f"[{broker_sym}] only {n_got:,}/{n_bars:,} bars — "
-                    f"terminal still syncing? Waiting 10s and retrying..."
+                    f"[{broker_sym}] got {n_got:,}/{n_bars:,} bars — "
+                    f"using them anyway (terminal may still be syncing)"
                 )
-                time.sleep(10)
-                rates2 = mt5.copy_rates_from_pos(
-                    broker_sym, mt5.TIMEFRAME_M5, 0, n_bars + 1
-                )
-                n_got2 = len(rates2) if rates2 is not None else 0
-                if rates2 is not None and n_got2 > n_got:
-                    rates = rates2
-                    logger.info(
-                        f"[{broker_sym}] retry gained {n_got2 - n_got:,} more bars "
-                        f"({n_got2:,} total)"
-                    )
-                break
+            break   # always stop here if we have enough bars
         else:
             logger.warning(
                 f"[{broker_sym}] fetch attempt {n_bars:,} bars -> "
