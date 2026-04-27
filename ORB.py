@@ -1277,21 +1277,27 @@ def _process_safe(canon, broker, sym_st, params, balance):
 
 def run_live():
     global _CLOCK_BROKER, _MAX_TRADES_DAY_COMBO
+    print("SCRIPT STARTED", flush=True)
     print("ORB V5 starting...", flush=True)
+    sys.stdout.flush()
 
     # MT5 init
+    print("Waiting for MT5 terminal to be ready...", flush=True)
     for attempt in range(30):
         ok  = mt5.initialize()
         err = mt5.last_error()
-        print(f"  MT5 init attempt {attempt+1}/30: ok={ok} err={err}", flush=True)
+        print(f"  attempt {attempt+1}/30: init={ok} error={err}", flush=True)
         if ok:
             break
         time.sleep(3)
     else:
+        print("ERROR: MT5 terminal did not respond after 90s", flush=True)
         raise RuntimeError("MT5 did not respond after 90s")
 
+    print("MT5 initialized — logging in...", flush=True)
     auth = mt5.login(LOGIN, PASSWORD, SERVER)
-    print(f"Login: {auth}  error={mt5.last_error()}", flush=True)
+    print(f"Login result: {auth}  error={mt5.last_error()}", flush=True)
+    print(f"account_info: {mt5.account_info()}", flush=True)
     if not auth:
         mt5.shutdown()
         raise RuntimeError(f"Login failed: {mt5.last_error()}")
@@ -1305,8 +1311,10 @@ def run_live():
                 f"Daily budget: ${DAILY_LOSS_BUDGET:.2f} ({DAILY_LOSS_CAP_PCT:.2%})")
 
     # Symbol map
+    print("Building symbol map...", flush=True)
     logger.info("=== SYMBOL DIAGNOSTIC ===")
     sym_map, active = build_symbol_map()
+    print(f"Active symbols: {active}", flush=True)
     if not active:
         logger.error("No symbols — shutting down")
         mt5.shutdown()
@@ -1314,8 +1322,10 @@ def run_live():
 
     for canon in active:
         broker = sym_map[canon]
+        print(f"  Getting symbol_info for {canon} ({broker})...", flush=True)
         info   = mt5.symbol_info(broker)
         if info is None:
+            print(f"  ERROR: symbol_info None for {canon}", flush=True)
             logger.error(f"  {canon}: symbol_info None")
             continue
         tvpl = info.trade_tick_value / info.trade_tick_size if info.trade_tick_size > 0 else 1.0
@@ -1328,27 +1338,46 @@ def run_live():
             "pip":      pip,
             "point":    info.point if info.point > 0 else pip,
         }
-        stops_lvl = int(info.trade_stops_level or 0)
-        logger.info(f"  {canon} ({broker}): digits={info.digits} "
-                    f"tvpl={tvpl:.6f} vol_min={info.volume_min} "
-                    f"vol_step={info.volume_step} pip={pip} "
-                    f"stops_level={stops_lvl}  params={BEST_PARAMS[canon]}")
+        stops_lvl  = int(info.trade_stops_level or 0)
+        point      = info.point if info.point > 0 else pip
+        min_sl_pts = stops_lvl * point
+        tick   = mt5.symbol_info_tick(broker)
+        tvpl_v = (info.trade_tick_value / info.trade_tick_size
+                  if info.trade_tick_size > 0 else "N/A")
+        logger.info(
+            f"  {canon} ({broker}): digits={info.digits} "
+            f"tick_val/lot={tvpl_v} "
+            f"vol_min={info.volume_min} vol_step={info.volume_step} "
+            f"pip={pip} "
+            f"stops_level={stops_lvl}pts ({min_sl_pts:.5f} price units) "
+            f"spread={tick.ask - tick.bid if tick else 'N/A'} "
+            f"params={BEST_PARAMS[canon]}"
+        )
+        print(f"  {canon}: digits={info.digits} tvpl={tvpl_v} "
+              f"vol_min={info.volume_min} stops_level={stops_lvl} "
+              f"params={BEST_PARAMS[canon]}", flush=True)
 
     _MAX_TRADES_DAY_COMBO = sum(BEST_PARAMS[s]["max_trades_day"] for s in active)
+    per_trade = DAILY_LOSS_BUDGET / _MAX_TRADES_DAY_COMBO if _MAX_TRADES_DAY_COMBO else 0
     logger.info(f"  max_trades_combo={_MAX_TRADES_DAY_COMBO}  "
-                f"per_trade_budget=${DAILY_LOSS_BUDGET/_MAX_TRADES_DAY_COMBO:.2f}")
-    logger.info(f"  MAX_RISK_MULTIPLE={MAX_RISK_MULTIPLE}x")
+                f"per_trade_budget=${per_trade:.2f}")
+    logger.info(f"  Risk guard: MAX_RISK_MULTIPLE={MAX_RISK_MULTIPLE}x")
     logger.info("=== END DIAGNOSTIC ===")
+    print("=== END DIAGNOSTIC ===", flush=True)
 
     # Init CSV locks
+    print("Initialising CSV locks...", flush=True)
     for canon in active:
         _csv_lock[canon] = threading.Lock()
 
     # ATR cache startup (CSV + gap or small broker fetch)
+    print("=== ATR CACHE STARTUP ===", flush=True)
     logger.info("=== ATR CACHE STARTUP ===")
     for canon in list(active):
         broker = sym_map[canon]
+        print(f"  [{canon}] init_atr_cache...", flush=True)
         ok = init_atr_cache(canon, broker)
+        print(f"  [{canon}] init_atr_cache result: {ok}", flush=True)
         if not ok:
             logger.error(f"  {canon}: ATR cache init failed — removing")
             active.remove(canon)
@@ -1356,6 +1385,7 @@ def run_live():
         logger.error("No symbols with ATR cache — shutting down")
         mt5.shutdown()
         return
+    print("=== END ATR CACHE STARTUP ===", flush=True)
     logger.info("=== END ATR CACHE STARTUP ===")
 
     _CLOCK_BROKER = sym_map[active[0]]
