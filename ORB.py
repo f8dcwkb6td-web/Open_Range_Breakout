@@ -295,87 +295,85 @@ def _csv_path(canon: str) -> str:
 
 
 def _load_csv(canon: str) -> object:
-    """
-    Load a bar CSV into a normalised DataFrame with columns:
-        time_utc (datetime64), open, high, low, close (float64)
-
-    Handles three layouts automatically (auto-detected from header):
-
-      Layout A — engine-written (this script's _append_bar_to_csv output):
-          time_utc, open, high, low, close
-          2024-01-15 08:00:00, 38500.0, ...
-
-      Layout B — MT5 "History Center" export (two separate columns):
-          <DATE>, <TIME>, <OPEN>, <HIGH>, <LOW>, <CLOSE>, ...
-          2024.01.15, 08:00, 38500.0, ...
-
-      Layout C — MT5 single datetime column:
-          <DATE>, <OPEN>, ...    (date field already contains "2024.01.15 08:00")
-    """
     path = _csv_path(canon)
     if not os.path.isfile(path):
         return None
     try:
-        # Read everything as strings so dot-dates aren't mangled by pandas
-        df = pd.read_csv(path, dtype=str)
+        # Auto-detect separator from first line so reader always matches writer
+        with open(path, "r", encoding="utf-8") as _f:
+            first_line = _f.readline()
+        sep = "\t" if "\t" in first_line else ","
+        df = pd.read_csv(path, sep=sep, engine="python")
 
-        # Normalise column names: strip whitespace and angle-brackets, lowercase
-        df.columns = [c.strip().strip("<>").lower() for c in df.columns]
+        # Normalise column names: strip whitespace, angle-brackets, lowercase
+        # Also strip leading 't' that MT5 sometimes prepends (tdate, ttime, etc.)
+        def _clean_col(c):
+            c = c.strip().lower().replace("<", "").replace(">", "")
+            if c.startswith("t") and c[1:] in (
+                "date", "time", "open", "high", "low", "close",
+                "tickvol", "vol", "spread"
+            ):
+                c = c[1:]
+            return c
 
-        # ── Detect and build the unified time_utc column ───────────────────
-        if "time_utc" in df.columns:
-            # Layout A: already correct column name
-            df["time_utc"] = pd.to_datetime(df["time_utc"].str.strip(), utc=False)
+        df.columns = [_clean_col(c) for c in df.columns]
 
-        elif "date" in df.columns and "time" in df.columns:
-            # Layout B: separate date + time columns
-            # Replace MT5 dot-separators so pandas can parse cleanly
-            combined = (df["date"].str.strip().str.replace(".", "-", regex=False)
+        # ── Build unified time_utc column ──────────────────────────────────
+        if "date" in df.columns and "time" in df.columns:
+            # MT5 export: separate date + time columns ("2024.01.15", "08:00")
+            combined = (df["date"].astype(str).str.strip()
                         + " "
-                        + df["time"].str.strip())
-            df["time_utc"] = pd.to_datetime(combined, dayfirst=False)
-            df.drop(columns=["date", "time"], inplace=True)
-
-        elif "date" in df.columns:
-            # Layout C: single column that may hold "2024.01.15 08:00"
-            df["time_utc"] = pd.to_datetime(
-                df["date"].str.strip().str.replace(".", "-", regex=False),
-                dayfirst=False,
+                        + df["time"].astype(str).str.strip())
+            fixed = combined.str.replace(
+                r"(\d{4})\.(\d{2})\.(\d{2})",
+                lambda m: f"{m.group(1)}-{m.group(2)}-{m.group(3)}",
+                regex=True,
             )
-            df.drop(columns=["date"], inplace=True)
+            df["time_utc"] = pd.to_datetime(fixed)
+            logger.info(
+                f"[{canon}] CSV: combined date+time columns, "
+                f"first bar: {df['time_utc'].iloc[0]}"
+            )
+
+        elif "time_utc" in df.columns:
+            # Engine-written format: single "time_utc" column
+            df["time_utc"] = pd.to_datetime(df["time_utc"].astype(str))
+
+        elif "time" in df.columns:
+            # Single "time" column — could be unix int or string datetime
+            if pd.api.types.is_numeric_dtype(df["time"]):
+                df["time_utc"] = pd.to_datetime(
+                    df["time"].astype(np.int64), unit="s"
+                )
+            else:
+                sample = str(df["time"].iloc[0]).strip()
+                if "." in sample.split(" ")[0]:
+                    fixed = df["time"].astype(str).str.replace(
+                        r"(\d{4})\.(\d{2})\.(\d{2})",
+                        lambda m: f"{m.group(1)}-{m.group(2)}-{m.group(3)}",
+                        regex=True,
+                    )
+                    df["time_utc"] = pd.to_datetime(fixed)
+                else:
+                    df["time_utc"] = pd.to_datetime(df["time"].astype(str))
+            if hasattr(df["time_utc"].dt, "tz") and df["time_utc"].dt.tz is not None:
+                df["time_utc"] = (df["time_utc"].dt.tz_convert("UTC")
+                                                 .dt.tz_localize(None))
 
         else:
-            # Last resort: treat first column as the timestamp
-            first_col = df.columns[0]
-            logger.warning(
-                f"[{canon}] CSV: unrecognised timestamp column '{first_col}' "
-                f"— attempting parse"
+            raise ValueError(
+                f"CSV has no usable time column. Columns found: {list(df.columns)}"
             )
-            df["time_utc"] = pd.to_datetime(
-                df[first_col].str.strip().str.replace(".", "-", regex=False),
-                dayfirst=False,
-            )
-            if first_col != "time_utc":
-                df.drop(columns=[first_col], inplace=True)
 
-        # ── Validate required OHLC columns ────────────────────────────────
-        missing = [c for c in ("open", "high", "low", "close") if c not in df.columns]
-        if missing:
-            logger.error(
-                f"[{canon}] CSV missing columns: {missing}  "
-                f"available: {list(df.columns)}"
-            )
-            return None
-
-        # ── Cast OHLC to float64 ──────────────────────────────────────────
+        # ── Keep only OHLC + time_utc ──────────────────────────────────────
+        df = df[["time_utc", "open", "high", "low", "close"]].copy()
         for col, dtype in CSV_DTYPE.items():
             df[col] = pd.to_numeric(df[col], errors="coerce").astype(dtype)
 
-        # ── Final cleanup ─────────────────────────────────────────────────
+        df.dropna(inplace=True)
         df.sort_values("time_utc", inplace=True)
         df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
-        df.dropna(subset=["time_utc", "open", "high", "low", "close"], inplace=True)
-        df = df[["time_utc", "open", "high", "low", "close"]].reset_index(drop=True)
+        df.reset_index(drop=True, inplace=True)
 
         logger.info(
             f"[{canon}] CSV loaded: {len(df):,} bars  "
@@ -391,17 +389,30 @@ def _load_csv(canon: str) -> object:
 
 def _append_bar_to_csv(canon: str, bar_time: pd.Timestamp,
                         o: float, h: float, l: float, c: float) -> None:
-    """Thread-safe append of one bar to CSV."""
+    """Thread-safe append of one bar to CSV.
+    Writes in the same separator format as the existing file (auto-detected),
+    or tab-separated when creating a new file (matching MT5 export format).
+    Never uses csv.writer quoting — plain string writes prevent any
+    'more fields than expected' tokenisation errors.
+    """
     path = _csv_path(canon)
     lock = _csv_lock[canon]
     new_file = not os.path.isfile(path)
     with lock:
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
+        # Detect separator from existing file so appended rows always match
+        if not new_file:
+            with open(path, "r", encoding="utf-8") as _f:
+                first_line = _f.readline()
+            sep = "\t" if "\t" in first_line else ","
+        else:
+            sep = "\t"   # new file: use tab to match MT5 export default
+        with open(path, "a", newline="\n", encoding="utf-8") as f:
             if new_file:
-                writer.writerow(CSV_COLUMNS)
-            writer.writerow([bar_time.strftime("%Y-%m-%d %H:%M:%S"),
-                              f"{o:.5f}", f"{h:.5f}", f"{l:.5f}", f"{c:.5f}"])
+                f.write(sep.join(CSV_COLUMNS) + "\n")
+            f.write(sep.join([
+                bar_time.strftime("%Y-%m-%d %H:%M:%S"),
+                f"{o:.5f}", f"{h:.5f}", f"{l:.5f}", f"{c:.5f}",
+            ]) + "\n")
 
 
 def _fetch_broker_range(broker_sym: str,
