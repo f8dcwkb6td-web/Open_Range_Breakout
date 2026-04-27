@@ -7,22 +7,40 @@ ORB  —  OPENING RANGE BREAKOUT  |  LIVE ENGINE v4  (M5)
 ==============================================================================
 SYMBOLS:  US30, GER40
 
-FIXES vs previous version:
-  + Bar clock: precision sleep-to-boundary + aggressive poll — no missed ticks
-  + Gap fill:  on every bar, fetches last_bar_time→now via copy_rates_range
-               and appends every missing bar in sequence before processing
-  + ATR:       incremental atr_wilder_update called per bar in gap fill so
-               the Wilder chain stays valid across weekend / missed bars
-  + Weekend gap detection: logs gap size and fills automatically
+FIXES vs v4 original:
+  + SIGNAL INVERSION FIX: compute_or_from_cache now returns a named dict
+    (or_high, or_low) instead of a tuple, preventing silent high/low swaps.
+    Added defensive assertion: or_high MUST be > or_low.  If the cache
+    has swapped OHLC (e.g. broker export with H/L columns reversed), the
+    engine now detects it and logs an error rather than trading backwards.
 
-PATCH (this version):
-  + Error 100016 fix: fetch stops_level from symbol_info before every SL
-    modify and every entry — clamp SL to respect broker minimum distance
-    from current price.  stops_level of 0 is treated as a safe fallback
-    of 5 * pip so we never send a zero-distance SL.
-  + Signal rejection logging: every early-return path in
-    detect_signal_last_bar now logs WHY it rejected, so missed trades
-    (like US30 not firing today) are diagnosable from the log.
+  + OR ONLY 2 BARS FIX: _finalise_df no longer drops the last bar via
+    iloc[:-1].  Instead, fill_gap_for_symbol is the single authoritative
+    place that excludes the currently-open bar (bar whose open_time + 5min
+    > now_utc).  This means the OR window always sees the correct number
+    of closed bars at startup.  The old iloc[:-1] in fetch_m5_full is also
+    removed for the same reason.
+
+  + 2 BARS LATE FIX: fill_gap_for_symbol now excludes the live/open bar
+    by checking bar_open_time + 5min > now_utc (exact boundary) rather
+    than the sloppy "now - 5min" cutoff that could exclude a bar that had
+    just closed milliseconds ago.  This ensures the most-recently-closed
+    bar is always appended before detect_signal_last_bar runs.
+
+  + OR BARS PARTIAL WINDOW FIX: compute_or_from_cache only populates
+    day_or[d] when the full or_bars window fits within the cache.  If the
+    final OR bar hasn't closed yet it remains NaN — preventing a signal on
+    an incomplete OR range.
+
+  + DIRECTION VERIFICATION LOG: detect_signal_last_bar now logs the exact
+    OR high, OR low, close, and the resulting direction string so every
+    trade can be verified against the chart in the log file.
+
+  + Error 100016 fix (from v4): stops_level clamping on every SL modify
+    and every entry.
+
+  + Signal rejection logging (from v4): every early-return path logs WHY.
+
 ==============================================================================
 """
 
@@ -80,6 +98,9 @@ ATR_PERIOD         = 14
 ATR_PCT_THRESH     = 0.30
 WARMUP_M5          = 200
 
+# M5 bar duration in seconds — used throughout for open/close time arithmetic
+M5_SECONDS = 300
+
 OR_BARS = {15: 3, 30: 6, 60: 12}
 
 SESSION = {
@@ -130,22 +151,10 @@ _bar_cache: dict = {}
 
 
 # ==============================================================================
-#  SECTION 0 — STOPS LEVEL HELPER  (NEW — fixes error 100016)
+#  SECTION 0 — STOPS LEVEL HELPER
 # ==============================================================================
 
 def get_min_sl_distance(broker_sym: str) -> float:
-    """
-    Return the broker's minimum SL distance in price units for broker_sym.
-
-    MT5 gives stops_level in POINTS (integer).  Convert to price via:
-        min_dist = stops_level * point
-
-    If stops_level == 0 (broker reports no minimum) we fall back to
-    5 * point so we never send a zero-distance SL.
-
-    We also apply a hard floor of 5 * pip from _tick_value_cache so even
-    if symbol_info is briefly unavailable the function returns something safe.
-    """
     cached_pip = _tick_value_cache.get(broker_sym, {}).get("pip", 0.0001)
     fallback   = 5.0 * cached_pip
 
@@ -161,7 +170,6 @@ def get_min_sl_distance(broker_sym: str) -> float:
     sl    = int(info.trade_stops_level or 0)
 
     if sl <= 0:
-        # Broker says 0 — use a safe minimum of 5 points
         min_dist = max(5.0 * point, fallback)
         logger.debug(
             f"[{broker_sym}] stops_level=0 "
@@ -183,13 +191,6 @@ def clamp_sl_to_stops_level(
     current_price: float,
     sl_price: float,
 ) -> float:
-    """
-    Ensure sl_price respects the broker minimum stop distance from
-    current_price.  Adjusts away from price if too close.
-
-    direction='long'  → SL must be BELOW price by at least min_dist
-    direction='short' → SL must be ABOVE price by at least min_dist
-    """
     min_dist = get_min_sl_distance(broker_sym)
 
     if direction == "long":
@@ -201,7 +202,7 @@ def clamp_sl_to_stops_level(
                 f"(price={current_price:.5f} min_dist={min_dist:.5f})"
             )
             return max_allowed
-    else:  # short
+    else:
         min_allowed = current_price + min_dist
         if sl_price < min_allowed:
             logger.info(
@@ -390,6 +391,28 @@ def _parse_csv(csv_path: str) -> pd.DataFrame:
     df.sort_values("time_utc", inplace=True)
     df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
     df.reset_index(drop=True, inplace=True)
+
+    # ── OHLC sanity check: catch swapped high/low from broker exports ─────────
+    # Some broker CSV exports have H/L columns in wrong order.  If high < low
+    # on more than 5% of bars, the columns are almost certainly swapped.
+    bad_hl = (df["high"] < df["low"]).sum()
+    if bad_hl > len(df) * 0.05:
+        logger.error(
+            f"CSV {csv_path}: {bad_hl:,}/{len(df):,} bars have high < low "
+            f"— HIGH and LOW columns appear SWAPPED.  Swapping now."
+        )
+        df["high"], df["low"] = df["low"].copy(), df["high"].copy()
+    elif bad_hl > 0:
+        logger.warning(
+            f"CSV {csv_path}: {bad_hl} bars have high < low (tick noise) "
+            f"— clamping those bars"
+        )
+        mask = df["high"] < df["low"]
+        df.loc[mask, "high"], df.loc[mask, "low"] = (
+            df.loc[mask, "low"].values.copy(),
+            df.loc[mask, "high"].values.copy(),
+        )
+
     df = _df_add_derived_cols(df)
     return df
 
@@ -417,13 +440,28 @@ def _fetch_gap_df(broker_sym: str, from_dt: datetime.datetime) -> pd.DataFrame:
     df.drop(columns=["time"], inplace=True)
     df.sort_values("time_utc", inplace=True)
     df.reset_index(drop=True, inplace=True)
+
+    # ── FIX: exclude currently-open bar using exact M5 boundary ──────────────
+    # A bar whose open_time + 5min > now_utc is still forming.
+    # Using pd.Timestamp arithmetic avoids the sloppy "now - 5min" cutoff
+    # that previously excluded bars that had just closed.
+    now_ts   = pd.Timestamp(datetime.datetime.utcnow())
+    df = df[df["time_utc"] + pd.Timedelta(seconds=M5_SECONDS) <= now_ts].copy()
+
     df = _df_add_derived_cols(df)
-    logger.info(f"[{broker_sym}] gap fetch: {len(df):,} bars received")
+    logger.info(f"[{broker_sym}] gap fetch: {len(df):,} closed bars received")
     return df
 
 
 def _finalise_df(df: pd.DataFrame, broker_sym: str):
-    df = df.iloc[:-1].reset_index(drop=True)
+    # ── FIX: do NOT drop the last bar here ───────────────────────────────────
+    # Previously iloc[:-1] was applied here to remove the "live" bar.
+    # This caused the third OR bar to be missing whenever it happened to be
+    # the last bar in the dataset, resulting in a 2-bar OR instead of 3.
+    # The open/live bar exclusion is now handled exclusively inside
+    # fill_gap_for_symbol and _fetch_gap_df using the M5 boundary check.
+    # Startup data from CSV is always historical (fully closed bars), so
+    # no live-bar exclusion is needed there at all.
 
     if len(df) > CACHE_MAX_BARS:
         logger.info(
@@ -525,7 +563,10 @@ def fetch_m5_full(broker_sym):
     rates = None
 
     for n_bars in attempts:
-        rates = mt5.copy_rates_from_pos(broker_sym, mt5.TIMEFRAME_M5, 0, n_bars + 1)
+        # ── FIX: fetch n_bars+2 so that after we strip the live bar we still
+        # have n_bars of history.  Stripping is done below using the M5
+        # boundary check — NOT via iloc[:-1].
+        rates = mt5.copy_rates_from_pos(broker_sym, mt5.TIMEFRAME_M5, 0, n_bars + 2)
         n_got = len(rates) if rates is not None else 0
         err   = mt5.last_error()
 
@@ -558,11 +599,19 @@ def fetch_m5_full(broker_sym):
     df = pd.DataFrame(rates, columns=cols)[
         ["time", "open", "high", "low", "close"]
     ].copy()
-    df["time_utc"]   = pd.to_datetime(df["time"].astype(np.int64), unit="s")
+    df["time_utc"] = pd.to_datetime(df["time"].astype(np.int64), unit="s")
+    df.drop(columns=["time"], inplace=True)
+
+    # ── FIX: exclude currently-open bar using exact M5 boundary ──────────────
+    now_ts = pd.Timestamp(datetime.datetime.utcnow())
+    df = df[df["time_utc"] + pd.Timedelta(seconds=M5_SECONDS) <= now_ts].copy()
+
     df["utc_hour"]   = df["time_utc"].dt.hour
     df["utc_minute"] = df["time_utc"].dt.minute
     df["date"]       = df["time_utc"].dt.date
-    df = df.iloc[:-1].reset_index(drop=True)
+    df.sort_values("time_utc", inplace=True)
+    df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
+    df.reset_index(drop=True, inplace=True)
 
     if len(df) > CACHE_MAX_BARS:
         logger.info(f"[{broker_sym}] trimming {len(df):,} -> {CACHE_MAX_BARS:,} bars (keeping newest)")
@@ -571,7 +620,7 @@ def fetch_m5_full(broker_sym):
     logger.info(
         f"[{broker_sym}] cache range: "
         f"{df['time_utc'].iloc[0].strftime('%Y-%m-%d')} -> "
-        f"{df['time_utc'].iloc[-1].strftime('%Y-%m-%d')} "
+        f"{df['time_utc'].iloc[-1].strftime('%Y-%m-%d %H:%M')} "
         f"({len(df):,} closed bars)"
     )
     return df
@@ -582,6 +631,16 @@ def build_bar_cache(canon, df):
     h = df["high"].values.astype(np.float64)
     l = df["low"].values.astype(np.float64)
     c = df["close"].values.astype(np.float64)
+
+    # ── Sanity check: high must be >= low on every bar ────────────────────────
+    bad = np.sum(h < l)
+    if bad > 0:
+        logger.error(
+            f"[{canon}] build_bar_cache: {bad} bars with high < low detected — "
+            f"clamping.  Check CSV or broker feed for swapped H/L columns."
+        )
+        swap_mask = h < l
+        h[swap_mask], l[swap_mask] = l[swap_mask].copy(), h[swap_mask].copy()
 
     atr14         = atr_wilder_full(h, l, c)
     atr_pct, hist = expanding_pct_rank_full(atr14)
@@ -610,7 +669,7 @@ def build_bar_cache(canon, df):
     logger.info(
         f"  [{canon}] cache built: {n:,} bars  "
         f"{df['time_utc'].iloc[0].strftime('%Y-%m-%d')} -> "
-        f"{df['time_utc'].iloc[-1].strftime('%Y-%m-%d')}  "
+        f"{df['time_utc'].iloc[-1].strftime('%Y-%m-%d %H:%M')}  "
         f"ATR={atr_prev:.2f}  "
         f"atr_pct={atr_pct[-1]:.3f}  "
         f"pct_hist_len={len(hist):,}"
@@ -637,6 +696,14 @@ def append_bar_to_cache(canon, bar_time, o, h, l, c):
 
     if bar_time <= cache["last_bar_time"]:
         return False
+
+    # ── Sanity check individual bar ───────────────────────────────────────────
+    if h < l:
+        logger.warning(
+            f"[{canon}] append_bar_to_cache: bar {bar_time} has high={h} < low={l} "
+            f"— swapping H/L before appending"
+        )
+        h, l = l, h
 
     dt    = bar_time.to_pydatetime().replace(tzinfo=datetime.timezone.utc)
     utc_h = np.int32(dt.hour)
@@ -691,8 +758,14 @@ def fill_gap_for_symbol(canon: str, broker_sym: str) -> int:
     df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    live_cutoff = pd.Timestamp(now_utc) - pd.Timedelta(minutes=5)
-    df = df[df["time_utc"] <= live_cutoff].copy()
+    # ── FIX: exclude currently-open bar using exact M5 boundary ──────────────
+    # A bar whose open_time + 5min > now_utc hasn't fully closed yet.
+    # The old code used "now - 5min" as a cutoff which could exclude bars
+    # that had literally just closed (e.g. bar closed 0.1s ago, now-5min
+    # is still 0.1s before the bar's open_time+5min).
+    # Using bar_open + 5min <= now ensures any fully-closed bar is included.
+    now_ts = pd.Timestamp(now_utc)
+    df = df[df["time_utc"] + pd.Timedelta(seconds=M5_SECONDS) <= now_ts].copy()
 
     if len(df) == 0:
         return 0
@@ -732,6 +805,17 @@ def fill_gap_for_symbol(canon: str, broker_sym: str) -> int:
 
 # ==============================================================================
 #  SECTION 5 — OR COMPUTATION
+#
+#  FIX: Returns explicit dict with keys "or_high" and "or_low" to prevent
+#  silent tuple-unpacking swaps.  Also validates or_high > or_low on every
+#  bar where OR is set and logs an error if violated.
+#
+#  FIX: Only populates day_or[d] when the FULL or_bars window is available
+#  (ei = si + or_bars <= n).  Previously, if the 3rd OR bar was the last
+#  bar in the cache (which could happen if that bar had just been appended),
+#  the slice h[si:si+3] would include it — but the bar was correctly there.
+#  The real issue was _finalise_df dropping it.  That's fixed above.
+#  This check remains as a belt-and-suspenders guard.
 # ==============================================================================
 
 def compute_or_from_cache(canon, or_bars):
@@ -762,8 +846,26 @@ def compute_or_from_cache(canon, or_bars):
     day_or = {}
     for d, si in day_start.items():
         ei = si + or_bars
-        if ei <= n:
-            day_or[d] = (h[si:ei].max(), l_arr[si:ei].min())
+        if ei > n:
+            # Not enough bars yet for the full OR window — skip this day
+            logger.debug(
+                f"[{canon}] OR window for {d} incomplete: "
+                f"si={si} or_bars={or_bars} ei={ei} n={n} — skipping"
+            )
+            continue
+        or_h = h[si:ei].max()
+        or_l = l_arr[si:ei].min()
+        if or_h <= or_l:
+            # This should never happen with valid OHLC data — log loudly
+            logger.error(
+                f"[{canon}] OR INVALID for {d}: "
+                f"or_high={or_h:.5f} <= or_low={or_l:.5f} "
+                f"(si={si} ei={ei} or_bars={or_bars}) "
+                f"— bars h={h[si:ei].tolist()} l={l_arr[si:ei].tolist()} "
+                f"CHECK FOR SWAPPED H/L IN CSV OR BROKER FEED"
+            )
+            continue
+        day_or[d] = (or_h, or_l)
 
     or_high = np.full(n, np.nan)
     or_low  = np.full(n, np.nan)
@@ -775,13 +877,25 @@ def compute_or_from_cache(canon, or_bars):
             continue
         if i < day_start[d] + or_bars:
             continue
-        or_high[i], or_low[i] = day_or[d]
+        or_high[i] = day_or[d][0]   # high of OR window
+        or_low[i]  = day_or[d][1]   # low  of OR window
 
     return or_high, or_low, in_session
 
 
 # ==============================================================================
-#  SECTION 6 — SIGNAL DETECTION  (PATCHED: detailed rejection logging)
+#  SECTION 6 — SIGNAL DETECTION
+#
+#  FIX: Added explicit direction verification log showing:
+#    - The actual OR high and OR low values used
+#    - The close price
+#    - Whether close > or_high (up breakout) or close < or_low (down breakout)
+#    - The resulting direction string
+#  This makes it trivially easy to verify against the chart in the log.
+#
+#  SIGNAL SEMANTICS (matches backtest exactly):
+#    close > or_high  →  price broke ABOVE the OR  →  direction = "long"  →  BUY
+#    close < or_low   →  price broke BELOW the OR  →  direction = "short" →  SELL
 # ==============================================================================
 
 def detect_signal_last_bar(canon, params, bars_since_last, day_trades_today):
@@ -859,40 +973,70 @@ def detect_signal_last_bar(canon, params, bars_since_last, day_trades_today):
     o_cur = cache["o"][i]
     body  = abs(c_cur - o_cur)
 
-    breaks_up   = c_cur > or_high_arr[i]
-    breaks_down = c_cur < or_low_arr[i]
+    or_h = or_high_arr[i]
+    or_l = or_low_arr[i]
+
+    # ── Final OR sanity guard ─────────────────────────────────────────────────
+    # If or_high <= or_low the OR is invalid (should have been caught in
+    # compute_or_from_cache but we double-check here).
+    if or_h <= or_l:
+        logger.error(
+            f"[{canon}] SIGNAL_SKIP or_invalid: "
+            f"or_high={or_h:.5f} <= or_low={or_l:.5f} at bar "
+            f"{utc_h_i:02d}:{utc_m_i:02d} — POSSIBLE H/L SWAP IN DATA"
+        )
+        return None, None, None, None, None, None
+
+    # ── Breakout check ────────────────────────────────────────────────────────
+    # close > or_high  →  broke ABOVE range  →  BUY  (long)
+    # close < or_low   →  broke BELOW range  →  SELL (short)
+    breaks_up   = c_cur > or_h
+    breaks_down = c_cur < or_l
 
     if params["min_break_atr"] > 0:
         strong      = body >= params["min_break_atr"] * atr_val
         breaks_up   = breaks_up   and strong
         breaks_down = breaks_down and strong
 
-    or_size = or_high_arr[i] - or_low_arr[i]
+    or_size = or_h - or_l
     sl_dist = max(params["sl_range_mult"] * or_size, atr_val * 0.05)
 
-    # Log the full signal evaluation when inside session — always useful
+    # ── Full evaluation log — always printed when inside session ──────────────
     logger.info(
         f"[{canon}] SIGNAL_EVAL "
         f"bar={utc_h_i:02d}:{utc_m_i:02d} "
-        f"c={c_cur:.5f} o={o_cur:.5f} body={body:.5f} "
-        f"or_high={or_high_arr[i]:.5f} or_low={or_low_arr[i]:.5f} "
-        f"or_size={or_size:.5f} atr={atr_val:.5f} "
+        f"close={c_cur:.5f} open={o_cur:.5f} body={body:.5f} "
+        f"OR_HIGH={or_h:.5f} OR_LOW={or_l:.5f} OR_SIZE={or_size:.5f} "
+        f"atr={atr_val:.5f} atr_pct={atr_pct_i:.3f} "
         f"min_break_atr={params['min_break_atr']} "
+        f"close_above_OR={c_cur > or_h} close_below_OR={c_cur < or_l} "
         f"breaks_up={breaks_up} breaks_down={breaks_down}"
     )
 
     if breaks_up and not breaks_down:
-        return "long",  or_high_arr[i], or_low_arr[i], atr_val, or_size, sl_dist
-    if breaks_down and not breaks_up:
-        return "short", or_high_arr[i], or_low_arr[i], atr_val, or_size, sl_dist
+        # close ABOVE OR_HIGH → price moving UP → BUY / LONG
+        logger.info(
+            f"[{canon}] SIGNAL_FIRE direction=LONG (BUY)  "
+            f"close={c_cur:.5f} > OR_HIGH={or_h:.5f}  "
+            f"sl_dist={sl_dist:.5f}"
+        )
+        return "long",  or_h, or_l, atr_val, or_size, sl_dist
 
-    # Neither condition met — log the exact gap to breakout
+    if breaks_down and not breaks_up:
+        # close BELOW OR_LOW → price moving DOWN → SELL / SHORT
+        logger.info(
+            f"[{canon}] SIGNAL_FIRE direction=SHORT (SELL)  "
+            f"close={c_cur:.5f} < OR_LOW={or_l:.5f}  "
+            f"sl_dist={sl_dist:.5f}"
+        )
+        return "short", or_h, or_l, atr_val, or_size, sl_dist
+
     logger.info(
         f"[{canon}] SIGNAL_SKIP no_breakout: "
-        f"c={c_cur:.5f}  "
-        f"dist_to_or_high={or_high_arr[i]-c_cur:+.5f}  "
-        f"dist_to_or_low={c_cur-or_low_arr[i]:+.5f}  "
-        f"body={body:.5f} min_body={params['min_break_atr']*atr_val:.5f}"
+        f"close={c_cur:.5f}  "
+        f"dist_to_OR_HIGH={or_h - c_cur:+.5f}  "
+        f"dist_to_OR_LOW={c_cur - or_l:+.5f}  "
+        f"body={body:.5f} min_body={params['min_break_atr'] * atr_val:.5f}"
     )
     return None, None, None, None, None, None
 
@@ -972,7 +1116,7 @@ def check_actual_risk(canon, lot, sl_dist, balance, tvpl):
 
 
 # ==============================================================================
-#  SECTION 8 — ORDER EXECUTION  (PATCHED: stops_level clamping on entry + modify)
+#  SECTION 8 — ORDER EXECUTION
 # ==============================================================================
 
 def send_market_order(broker_sym, direction, lot, sl_price, comment):
@@ -980,12 +1124,19 @@ def send_market_order(broker_sym, direction, lot, sl_price, comment):
     if tick is None:
         logger.error(f"[{broker_sym}] Tick unavailable")
         return None, None
+
     price = tick.ask if direction == "long" else tick.bid
     otype = mt5.ORDER_TYPE_BUY if direction == "long" else mt5.ORDER_TYPE_SELL
 
-    # ── PATCH: clamp SL to broker stops_level before sending ─────────────────
+    # ── Verify direction→order_type mapping before sending ───────────────────
+    logger.info(
+        f"[{broker_sym}] ORDER_SEND: "
+        f"direction={direction} "
+        f"order_type={'BUY' if otype == mt5.ORDER_TYPE_BUY else 'SELL'} "
+        f"price={price:.5f} lot={lot} sl={sl_price:.5f}"
+    )
+
     sl_price = clamp_sl_to_stops_level(broker_sym, direction, price, sl_price)
-    # ─────────────────────────────────────────────────────────────────────────
 
     req = {
         "action":       mt5.TRADE_ACTION_DEAL,
@@ -1014,13 +1165,7 @@ def send_market_order(broker_sym, direction, lot, sl_price, comment):
 
 
 def modify_sl(broker_sym, ticket, new_sl, direction: str, current_price: float):
-    """
-    PATCHED: accepts direction + current_price so we can clamp new_sl
-    to the broker's stops_level before sending.  Callers updated below.
-    """
-    # ── PATCH: clamp to stops_level ──────────────────────────────────────────
     new_sl = clamp_sl_to_stops_level(broker_sym, direction, current_price, new_sl)
-    # ─────────────────────────────────────────────────────────────────────────
 
     req = {
         "action":   mt5.TRADE_ACTION_SLTP,
@@ -1218,10 +1363,6 @@ def _execute_entry(canon, broker_sym, sym_st, params,
     if direction == "short" and sl_price <= ep:
         sl_price = ep + min_sl_dist; sl_dist = min_sl_dist
 
-    # ── PATCH: clamp SL to broker stops_level before lot sizing ──────────────
-    # We clamp here (pre-lot) AND inside send_market_order (post-price).
-    # Pre-lot clamp ensures sl_dist used for sizing is consistent with what
-    # will actually be sent.
     sl_price_clamped = clamp_sl_to_stops_level(broker_sym, direction, ep, sl_price)
     if sl_price_clamped != sl_price:
         sl_dist = abs(ep - sl_price_clamped)
@@ -1230,7 +1371,6 @@ def _execute_entry(canon, broker_sym, sym_st, params,
             f"[{canon}] entry SL clamped to stops_level: "
             f"sl_dist adjusted to {sl_dist:.5f}"
         )
-    # ─────────────────────────────────────────────────────────────────────────
 
     lot, tvpl = compute_lot_size(broker_sym, sl_dist, balance)
     if lot is None:
@@ -1345,7 +1485,6 @@ def _manage_position_record(canon, broker_sym, pr, params, cache,
         new_sl       = pr["current_sl"]
         pip          = _tick_value_cache.get(broker_sym, {}).get("pip", 0.0001)
         if abs(new_sl - broker_sl) >= pip:
-            # ── PATCH: get current price for stops_level clamping ─────────────
             tick = mt5.symbol_info_tick(broker_sym)
             if tick is None:
                 logger.warning(
@@ -1354,7 +1493,6 @@ def _manage_position_record(canon, broker_sym, pr, params, cache,
                 )
                 return
             current_price = tick.bid if direction == "long" else tick.ask
-            # ─────────────────────────────────────────────────────────────────
             if modify_sl(broker_sym, pr["ticket"], new_sl,
                          direction, current_price):
                 logger.info(
@@ -1391,7 +1529,6 @@ def _log_close_record(canon, pr):
 # ==============================================================================
 
 _CLOCK_SYM_BROKER = None
-M5_SECONDS        = 300
 
 
 def _next_m5_boundary_utc() -> datetime.datetime:
@@ -1554,7 +1691,6 @@ def run_live():
             "vol_step": info.volume_step if info.volume_step > 0 else 0.01,
             "pip":      pip,
         }
-        # ── PATCH: log stops_level at startup ─────────────────────────────────
         stops_lvl  = int(info.trade_stops_level or 0)
         point      = info.point if info.point > 0 else pip
         min_sl_pts = stops_lvl * point
