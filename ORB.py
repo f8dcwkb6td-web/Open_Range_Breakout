@@ -47,6 +47,13 @@ OTHER FIXES KEPT FROM v4:
   + Risk guard: reject if actual_risk > MAX_RISK_MULTIPLE * intended
   + Daily loss budget cap on position sizing
 
+CSV FIX (v5.1):
+──────────────────────────────────────────────────────────────────────────────
+  _load_csv now handles both engine-written CSVs (single time_utc column)
+  and MT5-exported CSVs (separate date + time columns, dot-separated dates,
+  angle-bracket column names like <open>).  Layout is auto-detected from
+  the header row so no manual config is needed.
+
 LOG:     orb_live_v5.log
 MAGIC:   202603263
 COMMENT: "ORB_V5"
@@ -288,23 +295,97 @@ def _csv_path(canon: str) -> str:
 
 
 def _load_csv(canon: str) -> object:
+    """
+    Load a bar CSV into a normalised DataFrame with columns:
+        time_utc (datetime64), open, high, low, close (float64)
+
+    Handles three layouts automatically (auto-detected from header):
+
+      Layout A — engine-written (this script's _append_bar_to_csv output):
+          time_utc, open, high, low, close
+          2024-01-15 08:00:00, 38500.0, ...
+
+      Layout B — MT5 "History Center" export (two separate columns):
+          <DATE>, <TIME>, <OPEN>, <HIGH>, <LOW>, <CLOSE>, ...
+          2024.01.15, 08:00, 38500.0, ...
+
+      Layout C — MT5 single datetime column:
+          <DATE>, <OPEN>, ...    (date field already contains "2024.01.15 08:00")
+    """
     path = _csv_path(canon)
     if not os.path.isfile(path):
         return None
     try:
-        df = pd.read_csv(path, parse_dates=["time_utc"])
-        df["time_utc"] = pd.to_datetime(df["time_utc"], utc=False)
+        # Read everything as strings so dot-dates aren't mangled by pandas
+        df = pd.read_csv(path, dtype=str)
+
+        # Normalise column names: strip whitespace and angle-brackets, lowercase
+        df.columns = [c.strip().strip("<>").lower() for c in df.columns]
+
+        # ── Detect and build the unified time_utc column ───────────────────
+        if "time_utc" in df.columns:
+            # Layout A: already correct column name
+            df["time_utc"] = pd.to_datetime(df["time_utc"].str.strip(), utc=False)
+
+        elif "date" in df.columns and "time" in df.columns:
+            # Layout B: separate date + time columns
+            # Replace MT5 dot-separators so pandas can parse cleanly
+            combined = (df["date"].str.strip().str.replace(".", "-", regex=False)
+                        + " "
+                        + df["time"].str.strip())
+            df["time_utc"] = pd.to_datetime(combined, dayfirst=False)
+            df.drop(columns=["date", "time"], inplace=True)
+
+        elif "date" in df.columns:
+            # Layout C: single column that may hold "2024.01.15 08:00"
+            df["time_utc"] = pd.to_datetime(
+                df["date"].str.strip().str.replace(".", "-", regex=False),
+                dayfirst=False,
+            )
+            df.drop(columns=["date"], inplace=True)
+
+        else:
+            # Last resort: treat first column as the timestamp
+            first_col = df.columns[0]
+            logger.warning(
+                f"[{canon}] CSV: unrecognised timestamp column '{first_col}' "
+                f"— attempting parse"
+            )
+            df["time_utc"] = pd.to_datetime(
+                df[first_col].str.strip().str.replace(".", "-", regex=False),
+                dayfirst=False,
+            )
+            if first_col != "time_utc":
+                df.drop(columns=[first_col], inplace=True)
+
+        # ── Validate required OHLC columns ────────────────────────────────
+        missing = [c for c in ("open", "high", "low", "close") if c not in df.columns]
+        if missing:
+            logger.error(
+                f"[{canon}] CSV missing columns: {missing}  "
+                f"available: {list(df.columns)}"
+            )
+            return None
+
+        # ── Cast OHLC to float64 ──────────────────────────────────────────
+        for col, dtype in CSV_DTYPE.items():
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype(dtype)
+
+        # ── Final cleanup ─────────────────────────────────────────────────
         df.sort_values("time_utc", inplace=True)
         df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        for col, dtype in CSV_DTYPE.items():
-            df[col] = df[col].astype(dtype)
-        logger.info(f"[{canon}] CSV loaded: {len(df):,} bars  "
-                    f"{df['time_utc'].iloc[0].date()} -> "
-                    f"{df['time_utc'].iloc[-1].strftime('%Y-%m-%d %H:%M')}")
+        df.dropna(subset=["time_utc", "open", "high", "low", "close"], inplace=True)
+        df = df[["time_utc", "open", "high", "low", "close"]].reset_index(drop=True)
+
+        logger.info(
+            f"[{canon}] CSV loaded: {len(df):,} bars  "
+            f"{df['time_utc'].iloc[0].date()} -> "
+            f"{df['time_utc'].iloc[-1].strftime('%Y-%m-%d %H:%M')}"
+        )
         return df
+
     except Exception as e:
-        logger.error(f"[{canon}] CSV load failed: {e}")
+        logger.error(f"[{canon}] CSV load failed: {e}", exc_info=True)
         return None
 
 
