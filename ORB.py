@@ -162,6 +162,13 @@ _csv_lock:   dict = {}   # canon -> threading.Lock()
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+def _find_csv(filename):
+    for d in (SCRIPT_DIR, os.getcwd()):
+        p = os.path.join(d, filename)
+        if os.path.isfile(p):
+            return p
+    return os.path.join(SCRIPT_DIR, filename)
+
 _MAX_TRADES_DAY_COMBO = 0
 
 
@@ -277,7 +284,7 @@ CSV_DTYPE   = {"open": np.float64, "high": np.float64,
                "low":  np.float64, "close": np.float64}
 
 def _csv_path(canon: str) -> str:
-    return os.path.join(SCRIPT_DIR, f"{canon}.csv")
+    return _find_csv(f"{canon}.cash.csv")
 
 
 def _load_csv(canon: str) -> object:
@@ -560,8 +567,8 @@ def compute_or(df: pd.DataFrame, canon: str, or_bars: int):
     for d, si in day_start.items():
         ei = si + or_bars
         if ei > n:
-            logger.debug(f"[{canon}] OR window for {d} incomplete "
-                         f"(si={si} ei={ei} n={n}) — skipping")
+            logger.info(f"[{canon}] OR window for {d} incomplete "
+                        f"(si={si} ei={ei} n={n}) — skipping")
             continue
         or_h = h[si:ei].max()
         or_l = l[si:ei].min()
@@ -609,7 +616,7 @@ def detect_signal(canon: str, df: pd.DataFrame, params: dict,
 
     n_atr = ac["n_bars"]
     if n_atr < WARMUP_M5:
-        logger.debug(f"[{canon}] SIGNAL_SKIP warmup: {n_atr} < {WARMUP_M5}")
+        logger.info(f"[{canon}] SIGNAL_SKIP warmup: {n_atr} < {WARMUP_M5}")
         return None, None, None, None, None, None
 
     atr_pct = ac["last_pct"]
@@ -644,7 +651,7 @@ def detect_signal(canon: str, df: pd.DataFrame, params: dict,
     utc_m_i = int(utc_m[i])
 
     if not in_sess[i]:
-        logger.debug(f"[{canon}] SIGNAL_SKIP session: "
+        logger.info(f"[{canon}] SIGNAL_SKIP session: "
                      f"{utc_h_i:02d}:{utc_m_i:02d} outside "
                      f"{cfg['open_h']:02d}:{cfg['open_m']:02d}-"
                      f"{cfg['close_h']:02d}:00")
