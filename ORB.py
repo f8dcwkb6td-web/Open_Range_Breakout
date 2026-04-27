@@ -202,7 +202,7 @@ def clamp_sl(broker_sym: str, direction: str, price: float, sl: float) -> float:
 #  SECTION 1 — SYMBOL RESOLVER
 # ==============================================================================
 
-def resolve_symbol(canonical: str) -> str | None:
+def resolve_symbol(canonical: str) -> object:
     all_broker = {s.name.upper(): s.name for s in (mt5.symbols_get() or [])}
     for alias in SYMBOL_ALIASES[canonical]:
         info = mt5.symbol_info(alias)
@@ -280,7 +280,7 @@ def _csv_path(canon: str) -> str:
     return os.path.join(SCRIPT_DIR, f"{canon}.csv")
 
 
-def _load_csv(canon: str) -> pd.DataFrame | None:
+def _load_csv(canon: str) -> object:
     path = _csv_path(canon)
     if not os.path.isfile(path):
         return None
@@ -343,7 +343,7 @@ def _fetch_broker_range(broker_sym: str,
 #  This is the ONLY large fetch — and it shrinks every run as the CSV grows.
 # ==============================================================================
 
-def _build_atr_df(canon: str, broker_sym: str) -> pd.DataFrame | None:
+def _build_atr_df(canon: str, broker_sym: str) -> object:
     """
     Return a DataFrame with enough history to seed the ATR percentile cache.
     Strategy:
@@ -492,7 +492,7 @@ def update_atr_cache_full(canon: str, bar_time: pd.Timestamp,
 #  Used ONLY for OR computation and close price.  NOT for ATR percentile.
 # ==============================================================================
 
-def fetch_m5_signal(broker_sym: str) -> pd.DataFrame | None:
+def fetch_m5_signal(broker_sym: str) -> object:
     """Fetch last SIGNAL_BARS closed M5 bars for OR + signal detection."""
     rates = mt5.copy_rates_from_pos(
         broker_sym, mt5.TIMEFRAME_M5, 0, SIGNAL_BARS + 2
@@ -1181,7 +1181,7 @@ def process_symbol(canon: str, broker_sym: str, sym_st: dict,
 #  SECTION 14 — BAR CLOCK
 # ==============================================================================
 
-_CLOCK_BROKER: str | None = None
+_CLOCK_BROKER= None
 M5_SECONDS_TD = datetime.timedelta(seconds=M5_SECONDS)
 
 
@@ -1193,7 +1193,7 @@ def _next_m5_boundary() -> datetime.datetime:
     return now + datetime.timedelta(seconds=wait)
 
 
-def _broker_last_bar() -> pd.Timestamp | None:
+def _broker_last_bar() -> object:
     if _CLOCK_BROKER is None:
         return None
     rates = mt5.copy_rates_from_pos(_CLOCK_BROKER, mt5.TIMEFRAME_M5, 0, 2)
@@ -1202,7 +1202,7 @@ def _broker_last_bar() -> pd.Timestamp | None:
     return None
 
 
-def wait_for_new_bar(last_bar_time: pd.Timestamp) -> pd.Timestamp:
+def wait_for_new_bar(last_bar_time: pd.Timestamp) -> object:
     while True:
         boundary  = _next_m5_boundary()
         sleep_sec = (boundary - datetime.datetime.utcnow()).total_seconds() - 1.0
