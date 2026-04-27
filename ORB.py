@@ -60,7 +60,7 @@ COMMENT: "ORB_V5"
 ==============================================================================
 """
 
-import os, sys, io, time, logging, datetime, bisect, csv
+import os, sys, io, time, logging, datetime, bisect
 import threading
 import numpy as np
 import pandas as pd
@@ -165,7 +165,6 @@ SYMBOLS = list(SESSION.keys())
 # ── Global caches ─────────────────────────────────────────────────────────────
 _tick_info:  dict = {}   # broker_sym -> {tvpl, vol_min, vol_step, pip, point}
 _atr_cache:  dict = {}   # canon -> {atr_prev, pct_hist, last_bar_time, n_bars}
-_csv_lock:   dict = {}   # canon -> threading.Lock()
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -387,33 +386,6 @@ def _load_csv(canon: str) -> object:
         return None
 
 
-def _append_bar_to_csv(canon: str, bar_time: pd.Timestamp,
-                        o: float, h: float, l: float, c: float) -> None:
-    """Thread-safe append of one bar to CSV.
-    Writes in the same separator format as the existing file (auto-detected),
-    or tab-separated when creating a new file (matching MT5 export format).
-    Never uses csv.writer quoting — plain string writes prevent any
-    'more fields than expected' tokenisation errors.
-    """
-    path = _csv_path(canon)
-    lock = _csv_lock[canon]
-    new_file = not os.path.isfile(path)
-    with lock:
-        # Detect separator from existing file so appended rows always match
-        if not new_file:
-            with open(path, "r", encoding="utf-8") as _f:
-                first_line = _f.readline()
-            sep = "\t" if "\t" in first_line else ","
-        else:
-            sep = "\t"   # new file: use tab to match MT5 export default
-        with open(path, "a", newline="\n", encoding="utf-8") as f:
-            if new_file:
-                f.write(sep.join(CSV_COLUMNS) + "\n")
-            f.write(sep.join([
-                bar_time.strftime("%Y-%m-%d %H:%M:%S"),
-                f"{o:.5f}", f"{h:.5f}", f"{l:.5f}", f"{c:.5f}",
-            ]) + "\n")
-
 
 def _fetch_broker_range(broker_sym: str,
                          from_dt: datetime.datetime,
@@ -456,12 +428,6 @@ def _build_atr_df(canon: str, broker_sym: str) -> object:
         gap_from = csv_df["time_utc"].iloc[-1].to_pydatetime() + datetime.timedelta(seconds=1)
         gap_df   = _fetch_broker_range(broker_sym, gap_from, datetime.datetime.utcnow())
         if len(gap_df) > 0:
-            # Write gap bars to CSV so future startups need even less fetching
-            for row in gap_df.itertuples(index=False):
-                _append_bar_to_csv(canon,
-                    pd.Timestamp(row.time_utc),
-                    float(row.open), float(row.high),
-                    float(row.low),  float(row.close))
             combined = pd.concat([csv_df, gap_df], ignore_index=True)
             combined.sort_values("time_utc", inplace=True)
             combined.drop_duplicates(subset="time_utc", keep="last", inplace=True)
@@ -489,13 +455,6 @@ def _build_atr_df(canon: str, broker_sym: str) -> object:
     df.sort_values("time_utc", inplace=True)
     df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
     df.reset_index(drop=True, inplace=True)
-    # Seed the CSV with what we fetched so next startup is cheap
-    logger.info(f"[{canon}] Writing {len(df):,} fetched bars to CSV for future startups")
-    for row in df.itertuples(index=False):
-        _append_bar_to_csv(canon,
-            pd.Timestamp(row.time_utc),
-            float(row.open), float(row.high),
-            float(row.low),  float(row.close))
     logger.info(f"[{canon}] ATR seed df: {len(df):,} bars  "
                 f"{df['time_utc'].iloc[0].date()} -> "
                 f"{df['time_utc'].iloc[-1].strftime('%Y-%m-%d %H:%M')}")
@@ -560,9 +519,6 @@ def update_atr_cache(canon: str, bar_time: pd.Timestamp,
     ac["prev_c"]       = c
     ac["n_bars"]      += 1
 
-    # Write bar to CSV
-    _append_bar_to_csv(canon, bar_time, h, l, l, c)   # note: o not stored in cache
-    # correction: we need open too — caller should pass it; done below
 
 
 # NOTE: update_atr_cache_full is the actual call used in the main loop.
@@ -580,7 +536,6 @@ def update_atr_cache_full(canon: str, bar_time: pd.Timestamp,
     ac["last_bar_time"] = bar_time
     ac["prev_c"]        = c
     ac["n_bars"]       += 1
-    _append_bar_to_csv(canon, bar_time, o, h, l, c)
 
 
 # ==============================================================================
@@ -1463,11 +1418,6 @@ def run_live():
     logger.info(f"  Risk guard: MAX_RISK_MULTIPLE={MAX_RISK_MULTIPLE}x")
     logger.info("=== END DIAGNOSTIC ===")
     print("=== END DIAGNOSTIC ===", flush=True)
-
-    # Init CSV locks
-    print("Initialising CSV locks...", flush=True)
-    for canon in active:
-        _csv_lock[canon] = threading.Lock()
 
     # ATR cache startup (CSV + gap or small broker fetch)
     print("=== ATR CACHE STARTUP ===", flush=True)
