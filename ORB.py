@@ -14,6 +14,15 @@ FIXES vs previous version:
   + ATR:       incremental atr_wilder_update called per bar in gap fill so
                the Wilder chain stays valid across weekend / missed bars
   + Weekend gap detection: logs gap size and fills automatically
+
+PATCH (this version):
+  + Error 100016 fix: fetch stops_level from symbol_info before every SL
+    modify and every entry — clamp SL to respect broker minimum distance
+    from current price.  stops_level of 0 is treated as a safe fallback
+    of 5 * pip so we never send a zero-distance SL.
+  + Signal rejection logging: every early-return path in
+    detect_signal_last_bar now logs WHY it rejected, so missed trades
+    (like US30 not firing today) are diagnosable from the log.
 ==============================================================================
 """
 
@@ -118,6 +127,91 @@ SYMBOLS = list(SESSION.keys())
 
 _tick_value_cache: dict = {}
 _bar_cache: dict = {}
+
+
+# ==============================================================================
+#  SECTION 0 — STOPS LEVEL HELPER  (NEW — fixes error 100016)
+# ==============================================================================
+
+def get_min_sl_distance(broker_sym: str) -> float:
+    """
+    Return the broker's minimum SL distance in price units for broker_sym.
+
+    MT5 gives stops_level in POINTS (integer).  Convert to price via:
+        min_dist = stops_level * point
+
+    If stops_level == 0 (broker reports no minimum) we fall back to
+    5 * point so we never send a zero-distance SL.
+
+    We also apply a hard floor of 5 * pip from _tick_value_cache so even
+    if symbol_info is briefly unavailable the function returns something safe.
+    """
+    cached_pip = _tick_value_cache.get(broker_sym, {}).get("pip", 0.0001)
+    fallback   = 5.0 * cached_pip
+
+    info = mt5.symbol_info(broker_sym)
+    if info is None:
+        logger.warning(
+            f"[{broker_sym}] get_min_sl_distance: symbol_info None "
+            f"— using fallback {fallback:.6f}"
+        )
+        return fallback
+
+    point = info.point if info.point > 0 else cached_pip
+    sl    = int(info.trade_stops_level or 0)
+
+    if sl <= 0:
+        # Broker says 0 — use a safe minimum of 5 points
+        min_dist = max(5.0 * point, fallback)
+        logger.debug(
+            f"[{broker_sym}] stops_level=0 "
+            f"— using safe floor {min_dist:.6f}"
+        )
+    else:
+        min_dist = sl * point
+
+    logger.debug(
+        f"[{broker_sym}] stops_level={sl} point={point:.8f} "
+        f"min_sl_dist={min_dist:.6f}"
+    )
+    return min_dist
+
+
+def clamp_sl_to_stops_level(
+    broker_sym: str,
+    direction: str,
+    current_price: float,
+    sl_price: float,
+) -> float:
+    """
+    Ensure sl_price respects the broker minimum stop distance from
+    current_price.  Adjusts away from price if too close.
+
+    direction='long'  → SL must be BELOW price by at least min_dist
+    direction='short' → SL must be ABOVE price by at least min_dist
+    """
+    min_dist = get_min_sl_distance(broker_sym)
+
+    if direction == "long":
+        max_allowed = current_price - min_dist
+        if sl_price > max_allowed:
+            logger.info(
+                f"[{broker_sym}] SL clamped (long): "
+                f"{sl_price:.5f} -> {max_allowed:.5f} "
+                f"(price={current_price:.5f} min_dist={min_dist:.5f})"
+            )
+            return max_allowed
+    else:  # short
+        min_allowed = current_price + min_dist
+        if sl_price < min_allowed:
+            logger.info(
+                f"[{broker_sym}] SL clamped (short): "
+                f"{sl_price:.5f} -> {min_allowed:.5f} "
+                f"(price={current_price:.5f} min_dist={min_dist:.5f})"
+            )
+            return min_allowed
+
+    return sl_price
 
 
 # ==============================================================================
@@ -539,12 +633,6 @@ def _trim_cache(cache):
 
 
 def append_bar_to_cache(canon, bar_time, o, h, l, c):
-    """
-    Append a single closed bar.  ATR is updated incrementally using the
-    Wilder smoother so the chain stays valid whether this is the very
-    next bar or a bar arriving after a weekend gap.
-    Returns True if the bar was new and appended, False if duplicate.
-    """
     cache = _bar_cache[canon]
 
     if bar_time <= cache["last_bar_time"]:
@@ -581,29 +669,13 @@ def append_bar_to_cache(canon, bar_time, o, h, l, c):
 
 
 # ==============================================================================
-#  SECTION 4b — GAP FILL  (called every bar, handles weekends automatically)
+#  SECTION 4b — GAP FILL
 # ==============================================================================
 
 def fill_gap_for_symbol(canon: str, broker_sym: str) -> int:
-    """
-    Fetch every CLOSED bar between cache["last_bar_time"] and now via
-    copy_rates_range, then append each one in chronological order using
-    append_bar_to_cache (which calls atr_wilder_update per bar).
-
-    KEY FIXES vs previous version:
-      - from_dt is nudged +1s so copy_rates_range does not re-return the
-        already-cached bar (the API is inclusive on from_dt).
-      - The "live bar" is identified by comparing its open time to
-        (now - 5 min), NOT by blindly dropping iloc[-1].  This means a
-        freshly-closed bar is never discarded.
-      - Every single-bar append is logged, not just multi-bar fills.
-
-    Returns number of new bars appended.
-    """
     cache   = _bar_cache[canon]
     now_utc = datetime.datetime.utcnow()
 
-    # +1 second so the inclusive range doesn't re-fetch the cached bar
     from_dt = cache["last_bar_time"].to_pydatetime() + datetime.timedelta(seconds=1)
     to_dt   = now_utc
 
@@ -619,8 +691,6 @@ def fill_gap_for_symbol(canon: str, broker_sym: str) -> int:
     df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    # The live/forming bar has an open time within the last 5 minutes.
-    # Drop it; every bar older than that is already closed.
     live_cutoff = pd.Timestamp(now_utc) - pd.Timedelta(minutes=5)
     df = df[df["time_utc"] <= live_cutoff].copy()
 
@@ -633,7 +703,6 @@ def fill_gap_for_symbol(canon: str, broker_sym: str) -> int:
     for row in df.itertuples(index=False):
         bar_time = pd.Timestamp(row.time_utc)
 
-        # Warn once at the start of any gap larger than one bar
         if not gap_warned and appended == 0:
             gap = bar_time - cache["last_bar_time"]
             if gap > pd.Timedelta(minutes=6):
@@ -652,7 +721,6 @@ def fill_gap_for_symbol(canon: str, broker_sym: str) -> int:
         if added:
             appended += 1
 
-    # Log every fill — single bar or many
     if appended > 0:
         logger.info(
             f"[{canon}] gap fill: {appended} bar(s) appended  "
@@ -713,7 +781,7 @@ def compute_or_from_cache(canon, or_bars):
 
 
 # ==============================================================================
-#  SECTION 6 — SIGNAL DETECTION
+#  SECTION 6 — SIGNAL DETECTION  (PATCHED: detailed rejection logging)
 # ==============================================================================
 
 def detect_signal_last_bar(canon, params, bars_since_last, day_trades_today):
@@ -722,10 +790,18 @@ def detect_signal_last_bar(canon, params, bars_since_last, day_trades_today):
     i     = n - 1
 
     if i < WARMUP_M5:
+        logger.debug(
+            f"[{canon}] SIGNAL_SKIP warmup: bar_idx={i} < WARMUP_M5={WARMUP_M5}"
+        )
         return None, None, None, None, None, None
 
     atr_pct_i = cache["atr_pct"][i]
     if np.isnan(atr_pct_i) or atr_pct_i < ATR_PCT_THRESH:
+        logger.info(
+            f"[{canon}] SIGNAL_SKIP atr_pct: "
+            f"atr_pct={atr_pct_i:.4f} < threshold={ATR_PCT_THRESH} "
+            f"(atr={cache['atr14'][i]:.5f})"
+        )
         return None, None, None, None, None, None
 
     cfg     = SESSION[canon]
@@ -737,22 +813,46 @@ def detect_signal_last_bar(canon, params, bars_since_last, day_trades_today):
         and utc_h_i < cfg["close_h"]
     )
     if not in_sess:
+        logger.debug(
+            f"[{canon}] SIGNAL_SKIP session: "
+            f"bar_utc={utc_h_i:02d}:{utc_m_i:02d} "
+            f"session={cfg['open_h']:02d}:{cfg['open_m']:02d}-"
+            f"{cfg['close_h']:02d}:00"
+        )
         return None, None, None, None, None, None
 
     or_bars_n = OR_BARS[params["or_minutes"]]
     or_high_arr, or_low_arr, _ = compute_or_from_cache(canon, or_bars_n)
 
     if np.isnan(or_high_arr[i]) or np.isnan(or_low_arr[i]):
+        logger.info(
+            f"[{canon}] SIGNAL_SKIP or_not_ready: "
+            f"bar_utc={utc_h_i:02d}:{utc_m_i:02d} "
+            f"or_high={'NaN' if np.isnan(or_high_arr[i]) else f'{or_high_arr[i]:.5f}'} "
+            f"or_low={'NaN' if np.isnan(or_low_arr[i]) else f'{or_low_arr[i]:.5f}'} "
+            f"(or_minutes={params['or_minutes']} or_bars={or_bars_n})"
+        )
         return None, None, None, None, None, None
 
     if bars_since_last < params["cooldown_bars"]:
+        logger.info(
+            f"[{canon}] SIGNAL_SKIP cooldown: "
+            f"bars_since_last={bars_since_last} < cooldown={params['cooldown_bars']}"
+        )
         return None, None, None, None, None, None
 
     if day_trades_today >= params["max_trades_day"]:
+        logger.info(
+            f"[{canon}] SIGNAL_SKIP max_trades: "
+            f"day_trades={day_trades_today} >= max={params['max_trades_day']}"
+        )
         return None, None, None, None, None, None
 
     atr_val = cache["atr14"][i]
     if np.isnan(atr_val) or atr_val <= 0:
+        logger.info(
+            f"[{canon}] SIGNAL_SKIP atr_invalid: atr={atr_val}"
+        )
         return None, None, None, None, None, None
 
     c_cur = cache["c"][i]
@@ -770,11 +870,30 @@ def detect_signal_last_bar(canon, params, bars_since_last, day_trades_today):
     or_size = or_high_arr[i] - or_low_arr[i]
     sl_dist = max(params["sl_range_mult"] * or_size, atr_val * 0.05)
 
+    # Log the full signal evaluation when inside session — always useful
+    logger.info(
+        f"[{canon}] SIGNAL_EVAL "
+        f"bar={utc_h_i:02d}:{utc_m_i:02d} "
+        f"c={c_cur:.5f} o={o_cur:.5f} body={body:.5f} "
+        f"or_high={or_high_arr[i]:.5f} or_low={or_low_arr[i]:.5f} "
+        f"or_size={or_size:.5f} atr={atr_val:.5f} "
+        f"min_break_atr={params['min_break_atr']} "
+        f"breaks_up={breaks_up} breaks_down={breaks_down}"
+    )
+
     if breaks_up and not breaks_down:
         return "long",  or_high_arr[i], or_low_arr[i], atr_val, or_size, sl_dist
     if breaks_down and not breaks_up:
         return "short", or_high_arr[i], or_low_arr[i], atr_val, or_size, sl_dist
 
+    # Neither condition met — log the exact gap to breakout
+    logger.info(
+        f"[{canon}] SIGNAL_SKIP no_breakout: "
+        f"c={c_cur:.5f}  "
+        f"dist_to_or_high={or_high_arr[i]-c_cur:+.5f}  "
+        f"dist_to_or_low={c_cur-or_low_arr[i]:+.5f}  "
+        f"body={body:.5f} min_body={params['min_break_atr']*atr_val:.5f}"
+    )
     return None, None, None, None, None, None
 
 
@@ -853,7 +972,7 @@ def check_actual_risk(canon, lot, sl_dist, balance, tvpl):
 
 
 # ==============================================================================
-#  SECTION 8 — ORDER EXECUTION
+#  SECTION 8 — ORDER EXECUTION  (PATCHED: stops_level clamping on entry + modify)
 # ==============================================================================
 
 def send_market_order(broker_sym, direction, lot, sl_price, comment):
@@ -863,6 +982,11 @@ def send_market_order(broker_sym, direction, lot, sl_price, comment):
         return None, None
     price = tick.ask if direction == "long" else tick.bid
     otype = mt5.ORDER_TYPE_BUY if direction == "long" else mt5.ORDER_TYPE_SELL
+
+    # ── PATCH: clamp SL to broker stops_level before sending ─────────────────
+    sl_price = clamp_sl_to_stops_level(broker_sym, direction, price, sl_price)
+    # ─────────────────────────────────────────────────────────────────────────
+
     req = {
         "action":       mt5.TRADE_ACTION_DEAL,
         "symbol":       broker_sym,
@@ -889,7 +1013,15 @@ def send_market_order(broker_sym, direction, lot, sl_price, comment):
     return result.order, price
 
 
-def modify_sl(broker_sym, ticket, new_sl):
+def modify_sl(broker_sym, ticket, new_sl, direction: str, current_price: float):
+    """
+    PATCHED: accepts direction + current_price so we can clamp new_sl
+    to the broker's stops_level before sending.  Callers updated below.
+    """
+    # ── PATCH: clamp to stops_level ──────────────────────────────────────────
+    new_sl = clamp_sl_to_stops_level(broker_sym, direction, current_price, new_sl)
+    # ─────────────────────────────────────────────────────────────────────────
+
     req = {
         "action":   mt5.TRADE_ACTION_SLTP,
         "symbol":   broker_sym,
@@ -903,7 +1035,8 @@ def modify_sl(broker_sym, ticket, new_sl):
     ):
         code = getattr(result, "retcode", None)
         logger.warning(
-            f"[{broker_sym}] SL modify failed retcode={code} new_sl={new_sl:.5f}"
+            f"[{broker_sym}] SL modify failed retcode={code} "
+            f"new_sl={new_sl:.5f} current_price={current_price:.5f}"
         )
         return False
     return True
@@ -1085,6 +1218,20 @@ def _execute_entry(canon, broker_sym, sym_st, params,
     if direction == "short" and sl_price <= ep:
         sl_price = ep + min_sl_dist; sl_dist = min_sl_dist
 
+    # ── PATCH: clamp SL to broker stops_level before lot sizing ──────────────
+    # We clamp here (pre-lot) AND inside send_market_order (post-price).
+    # Pre-lot clamp ensures sl_dist used for sizing is consistent with what
+    # will actually be sent.
+    sl_price_clamped = clamp_sl_to_stops_level(broker_sym, direction, ep, sl_price)
+    if sl_price_clamped != sl_price:
+        sl_dist = abs(ep - sl_price_clamped)
+        sl_price = sl_price_clamped
+        logger.info(
+            f"[{canon}] entry SL clamped to stops_level: "
+            f"sl_dist adjusted to {sl_dist:.5f}"
+        )
+    # ─────────────────────────────────────────────────────────────────────────
+
     lot, tvpl = compute_lot_size(broker_sym, sl_dist, balance)
     if lot is None:
         logger.error(f"[{canon}] Lot calc failed — entry cancelled")
@@ -1194,14 +1341,25 @@ def _manage_position_record(canon, broker_sym, pr, params, cache,
             pr["current_sl"] = min(pr["current_sl"], bar_l + trail_mult * ta)
 
     if broker_pos is not None:
-        broker_sl = broker_pos.sl or 0.0
-        new_sl    = pr["current_sl"]
-        pip       = _tick_value_cache.get(broker_sym, {}).get("pip", 0.0001)
+        broker_sl    = broker_pos.sl or 0.0
+        new_sl       = pr["current_sl"]
+        pip          = _tick_value_cache.get(broker_sym, {}).get("pip", 0.0001)
         if abs(new_sl - broker_sl) >= pip:
-            if modify_sl(broker_sym, pr["ticket"], new_sl):
+            # ── PATCH: get current price for stops_level clamping ─────────────
+            tick = mt5.symbol_info_tick(broker_sym)
+            if tick is None:
+                logger.warning(
+                    f"[{canon}] SL modify skipped — tick unavailable "
+                    f"ticket={pr['ticket']}"
+                )
+                return
+            current_price = tick.bid if direction == "long" else tick.ask
+            # ─────────────────────────────────────────────────────────────────
+            if modify_sl(broker_sym, pr["ticket"], new_sl,
+                         direction, current_price):
                 logger.info(
                     f"[{canon}] SL updated ticket={pr['ticket']} "
-                    f"{broker_sl:.5f} -> {new_sl:.5f} "
+                    f"{broker_sl:.5f} -> {pr['current_sl']:.5f} "
                     f"(hold={hc} be={pr['be_active']})"
                 )
 
@@ -1229,26 +1387,14 @@ def _log_close_record(canon, pr):
 
 
 # ==============================================================================
-#  SECTION 11 — BAR CLOCK  (precision sleep-to-boundary + aggressive poll)
-# ==============================================================================
-#
-#  Strategy:
-#    1. Compute the next M5 boundary (e.g. :00, :05, :10 ...) in wall-clock UTC.
-#    2. Sleep until 1 second BEFORE that boundary.
-#    3. Poll copy_rates_from_pos every 200 ms until the bar timestamp advances.
-#    4. Return the new bar timestamp.
-#
-#  This means we wake up at almost exactly bar-close regardless of whether
-#  the host machine drifted, and we never wait a full extra 5 minutes.
-#  Timeout after 90 s of polling (handles broker latency / weekend).
+#  SECTION 11 — BAR CLOCK
 # ==============================================================================
 
 _CLOCK_SYM_BROKER = None
-M5_SECONDS        = 300   # 5 minutes
+M5_SECONDS        = 300
 
 
 def _next_m5_boundary_utc() -> datetime.datetime:
-    """Return the next M5 bar-close time in UTC (always a multiple of 5 min)."""
     now  = datetime.datetime.utcnow()
     secs = now.hour * 3600 + now.minute * 60 + now.second
     rem  = secs % M5_SECONDS
@@ -1257,7 +1403,6 @@ def _next_m5_boundary_utc() -> datetime.datetime:
 
 
 def _get_broker_bar_time() -> pd.Timestamp | None:
-    """Return the timestamp of the most recently CLOSED M5 bar."""
     if _CLOCK_SYM_BROKER is None:
         return None
     rates = mt5.copy_rates_from_pos(_CLOCK_SYM_BROKER, mt5.TIMEFRAME_M5, 0, 2)
@@ -1267,19 +1412,12 @@ def _get_broker_bar_time() -> pd.Timestamp | None:
 
 
 def wait_for_new_bar(last_bar_time: pd.Timestamp) -> pd.Timestamp:
-    """
-    Precision bar clock.
-    Sleeps to the next M5 boundary then polls until the broker confirms
-    a new closed bar.  Never misses a bar; handles weekends by looping
-    through boundary after boundary until the broker responds.
-    """
     while True:
         boundary = _next_m5_boundary_utc()
         sleep_to = (boundary - datetime.datetime.utcnow()).total_seconds() - 1.0
         if sleep_to > 0:
             time.sleep(sleep_to)
 
-        # Aggressive poll: up to 90 s after boundary
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
             t = _get_broker_bar_time()
@@ -1287,8 +1425,6 @@ def wait_for_new_bar(last_bar_time: pd.Timestamp) -> pd.Timestamp:
                 return t
             time.sleep(0.2)
 
-        # If broker didn't advance in 90 s (e.g. weekend / holiday),
-        # loop back and wait for the next boundary.
         logger.debug(
             f"[clock] no new bar after boundary {boundary.strftime('%H:%M')} UTC — "
             f"retrying next boundary"
@@ -1365,7 +1501,6 @@ def run_live():
     global _CLOCK_SYM_BROKER, _MAX_TRADES_DAY_COMBO
     print("run_live() started", flush=True)
 
-    # ── MT5 init ──────────────────────────────────────────────────────────────
     print("Waiting for MT5 terminal to be ready...", flush=True)
     for _attempt in range(30):
         init_ok = mt5.initialize()
@@ -1400,7 +1535,6 @@ def run_live():
         f"Daily budget: ${DAILY_LOSS_BUDGET:.2f} ({DAILY_LOSS_CAP_PCT:.2%})"
     )
 
-    # ── Symbol resolution ─────────────────────────────────────────────────────
     logger.info("=== SYMBOL DIAGNOSTIC ===")
     sym_map, active_symbols = build_symbol_map()
 
@@ -1420,11 +1554,17 @@ def run_live():
             "vol_step": info.volume_step if info.volume_step > 0 else 0.01,
             "pip":      pip,
         }
+        # ── PATCH: log stops_level at startup ─────────────────────────────────
+        stops_lvl  = int(info.trade_stops_level or 0)
+        point      = info.point if info.point > 0 else pip
+        min_sl_pts = stops_lvl * point
         logger.info(
             f"  {canon} ({broker}): digits={info.digits} "
             f"tvpl={tvpl:.6f} "
             f"vol_min={info.volume_min} vol_step={info.volume_step} "
-            f"pip={pip} params={BEST_PARAMS[canon]}"
+            f"pip={pip} "
+            f"stops_level={stops_lvl}pts ({min_sl_pts:.5f} price units) "
+            f"params={BEST_PARAMS[canon]}"
         )
 
     _MAX_TRADES_DAY_COMBO = sum(
@@ -1444,7 +1584,6 @@ def run_live():
         mt5.shutdown()
         return
 
-    # ── Startup data load ─────────────────────────────────────────────────────
     logger.info(
         f"\n=== STARTUP DATA LOAD (CSV+gap or broker fetch, "
         f"cap {CACHE_MAX_BARS:,}) ==="
@@ -1476,7 +1615,6 @@ def run_live():
 
     sym_states = {canon: make_symbol_state() for canon in active_symbols}
 
-    # ── Startup recovery ──────────────────────────────────────────────────────
     logger.info("=== STARTUP RECOVERY ===")
     for canon in active_symbols:
         broker    = sym_map[canon]
@@ -1519,7 +1657,6 @@ def run_live():
     metrics   = Metrics(active_symbols)
     bar_count = 0
 
-    # Seed the bar clock from the broker
     last_bar_time = _get_broker_bar_time()
     if last_bar_time is None:
         last_bar_time = pd.Timestamp.utcnow()
@@ -1528,7 +1665,6 @@ def run_live():
         f"waiting for next M5 close..."
     )
 
-    # ── Main bar loop ─────────────────────────────────────────────────────────
     while True:
         try:
             new_bar_time  = wait_for_new_bar(last_bar_time)
@@ -1542,19 +1678,12 @@ def run_live():
                 f"----------------------------------------"
             )
 
-            # ── Step 1: gap fill for every symbol ────────────────────────────
-            # fill_gap_for_symbol fetches from last_bar_time→now via
-            # copy_rates_range and appends every missing bar incrementally.
-            # ATR is updated per-bar inside append_bar_to_cache.
-            # This handles weekend gaps, restarts, and occasional missed ticks
-            # automatically — no special-case needed.
             for canon in active_symbols:
                 broker = sym_map[canon]
                 n_new  = fill_gap_for_symbol(canon, broker)
                 if n_new == 0:
                     logger.debug(f"[{canon}] no new bars from gap fill")
 
-            # ── Step 2: process signal + position management ──────────────────
             balance = mt5.account_info().balance
 
             threads = []
