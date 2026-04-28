@@ -93,7 +93,7 @@ DAILY_LOSS_CAP_PCT = 0.0475
 DAILY_LOSS_BUDGET  = STARTING_BALANCE * DAILY_LOSS_CAP_PCT
 
 VOL_MIN  = 0.10
-VOL_STEP = 0.10
+VOL_STEP = 0.01
 VOL_MAX  = 250.0
 
 # ── Strategy constants ────────────────────────────────────────────────────────
