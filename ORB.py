@@ -93,7 +93,7 @@ DAILY_LOSS_CAP_PCT = 0.0475
 DAILY_LOSS_BUDGET  = STARTING_BALANCE * DAILY_LOSS_CAP_PCT
 
 VOL_MIN  = 0.10
-VOL_STEP = 0.01
+VOL_STEP = 0.10
 VOL_MAX  = 250.0
 
 # ── Strategy constants ────────────────────────────────────────────────────────
@@ -743,15 +743,36 @@ def load_history(canon: str, broker_sym: str) -> pd.DataFrame:
     return df
 
 
+def _last_closed_bar_open_time() -> datetime.datetime:
+    """
+    Return the open timestamp of the last fully closed M5 bar.
+    = floor(utcnow to 5-min grid) minus one bar.
+    Used as the safe upper bound for gap fills so the currently-forming
+    bar is never included in history.
+    """
+    now          = datetime.datetime.utcnow()
+    secs         = now.hour * 3600 + now.minute * 60 + now.second
+    rem          = secs % M5_SECONDS
+    forming_open = now - datetime.timedelta(seconds=rem)
+    return forming_open - datetime.timedelta(seconds=M5_SECONDS)
+
+
 def _fetch_broker_range(broker_sym: str,
                          from_dt: datetime.datetime,
                          to_dt:   datetime.datetime) -> pd.DataFrame:
-    rates = mt5.copy_rates_range(broker_sym, mt5.TIMEFRAME_M5, from_dt, to_dt)
+    # Clamp to_dt so the currently-forming bar is never included.
+    last_closed = _last_closed_bar_open_time()
+    safe_to     = min(to_dt, last_closed)
+    if safe_to < from_dt:
+        return pd.DataFrame(columns=["time_utc","open","high","low","close"])
+
+    rates = mt5.copy_rates_range(broker_sym, mt5.TIMEFRAME_M5, from_dt, safe_to)
     if rates is None or len(rates) == 0:
         return pd.DataFrame(columns=["time_utc","open","high","low","close"])
     df = pd.DataFrame(rates)[["time","open","high","low","close"]].copy()
     df["time_utc"] = pd.to_datetime(df["time"].astype(np.int64), unit="s")
     df.drop(columns=["time"], inplace=True)
+    # Secondary guard: drop any bar whose close time hasn't arrived yet
     now_ts = pd.Timestamp(datetime.datetime.utcnow())
     df = df[df["time_utc"] + pd.Timedelta(seconds=M5_SECONDS) <= now_ts].copy()
     df.sort_values("time_utc", inplace=True)
@@ -1502,9 +1523,19 @@ def run_live():
     logger.info("=== END RECOVERY ===")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
-    last_bar_time = _broker_last_bar_time() or pd.Timestamp.utcnow()
+    # Seed from the cache's own last bar, not the broker.
+    # The broker's last-closed-bar time can be ahead of the cache if the gap
+    # fill missed the most recent bar by a few milliseconds at startup — seeding
+    # from the broker would skip that bar forever.  Seeding from the cache
+    # guarantees wait_for_new_bar fires for every bar the cache hasn't seen.
+    cache_last_times = [
+        pd.Timestamp(int(caches[c]["times"][-1]))
+        for c in active
+    ]
+    last_bar_time = min(cache_last_times)   # conservative: use earliest
     logger.info(
-        f"Seeded bar time: {last_bar_time} — waiting for next M5 close..."
+        f"Seeded bar time from cache: {last_bar_time} — "
+        f"waiting for next M5 close..."
     )
 
     bar_count = 0
