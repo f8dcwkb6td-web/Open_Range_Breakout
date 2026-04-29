@@ -87,7 +87,7 @@ COMMENT = "ORB_V6"
 
 # ── Broker / risk constants ───────────────────────────────────────────────────
 STARTING_BALANCE   = 25_000.0
-RISK_PER_TRADE     = 0.01
+RISK_PER_TRADE     = 0.0085
 MAX_RISK_MULTIPLE  = 2.0
 DAILY_LOSS_CAP_PCT = 0.0475
 DAILY_LOSS_BUDGET  = STARTING_BALANCE * DAILY_LOSS_CAP_PCT
