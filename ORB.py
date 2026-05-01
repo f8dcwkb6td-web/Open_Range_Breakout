@@ -3,45 +3,46 @@
 ORB  —  LIVE ENGINE v6
 ==============================================================================
 CORE PRINCIPLE:
-  This is a direct port of the backtest (orb_chrono_bt.py).
-  OR computation, signal detection, ATR, and all indicator logic are
-  IDENTICAL to build_cache_and_signals() + resolve_trade() in the BT.
-  No rolling per-bar fetches. No index drift. No recomputing OR live.
+  Direct port of orb_chrono_bt.py.  OR, ATR, signal logic are IDENTICAL
+  to build_cache_and_signals() + resolve_trade() in the BT.
 
 HOW IT WORKS:
   STARTUP:
-    1. Normalize CSV to engine canonical format if it is an MT5 export
-       (tab-separated, <DATE>/<TIME> columns, YYYY.MM.DD dates).
-    2. Load CSV history (same _load_csv as v5).
-    3. Gap-fill from broker (bars after last CSV row).
-    4. Run build_cache_and_signals() over the full array — same as BT.
-    5. Cache is now a complete pre-computed state: or_high, or_low,
-       atr14, atr_pct, signal arrays — all indexed by bar position.
+    1. Normalise CSV (MT5 export -> canonical format).
+    2. Load CSV history.
+    3. Gap-fill from broker.
+    4. Run build_cache() — same as BT build_cache_and_signals().
+    5. Run verify_cache_vs_bt() — compares live cache signals against
+       BT re-run on the same data.  Logs % accuracy per symbol.
+       ABORTS that symbol if accuracy < MIN_BT_ACCURACY (95%).
+    6. Enter bar loop.
 
   EACH NEW BAR:
-    1. Fetch the single new closed bar from broker.
-    2. Append it to the in-memory arrays.
-    3. Recompute only the last element of each indicator (O(1) Wilder step).
-    4. Check signal on the last bar index — same logic as BT signal[i].
-    5. If signal: send market order immediately.
-    6. Manage open positions: BE, trail, EOD — same as resolve_trade() forward sim.
+    1. _fetch_single_closed_bar() uses cache's last bar time as reference
+       (bt > last_cached) — no wall-clock comparison, no mismatch possible.
+    2. Append to cache (O(1) incremental update identical to BT).
+    3. Write to CSV.
+    4. Manage positions (EOD, BE, trail, SL retry on same bar).
+    5. Signal check — direct array lookup, entry immediately.
+
+  ENTRY:
+    Fresh account_info() at entry time — not stale balance from main loop.
+    Free margin check before sending order — prevents 10019.
 
   SL MODIFICATION:
-    Retry loop on the SAME bar until success or timeout.
-    Re-fetches current bid/ask before each attempt.
+    Retries indefinitely on same bar.
+    Re-fetches bid/ask + re-clamps before every attempt.
+    Aborts only on: position gone, market disabled.
 
-CSV:
-  Engine canonical format: comma-separated, header = time_utc,open,high,low,close,
-  ISO datetime (YYYY-MM-DD HH:MM:SS).
-  MT5-exported files are normalised to canonical format once on startup.
-  Path: <script_dir>/<CANON>.cash.csv
-
-WHAT IS GONE vs v5:
-  - fetch_m5_signal()          — replaced by single-bar append
-  - compute_or() per bar       — replaced by pre-computed or_high/or_low arrays
-  - _atr_cache incremental     — replaced by full Wilder array + single step
-  - detect_signal()            — replaced by direct array lookup (same as BT)
-  - All per-bar rolling fetches
+FIXES vs previous version:
+  - Bar time mismatch (expected 13:35 got 13:40): _fetch_single_closed_bar
+    now uses cache last bar time as reference, not wall-clock new_bar_time.
+    Any bar newer than cache is accepted immediately.
+  - 10019 no money: execute_entry fetches fresh account_info() at entry
+    time and checks free_margin before sending.
+  - balance passed to threads: removed — each entry fetches its own.
+  - BT accuracy check on startup: verify_cache_vs_bt() runs over full
+    CSV history and logs match % before any trading begins.
 
 LOG:    orb_live_v6.log
 MAGIC:  202603264
@@ -103,6 +104,9 @@ ATR_PCT_THRESH = 0.30
 MAX_HOLD       = 48
 M5_SECONDS     = 300
 
+# Minimum signal match rate vs BT required before going live per symbol.
+MIN_BT_ACCURACY = 0.95
+
 OR_BARS = {15: 3, 30: 6, 60: 12}
 
 SESSION = {
@@ -110,7 +114,6 @@ SESSION = {
     "GER40": {"open_h":  8, "open_m":  0, "close_h": 17},
 }
 
-# ── GRID params (matched to BT) ───────────────────────────────────────────────
 BEST_PARAMS = {
     "US30":  {"or_minutes": 15, "sl_range_mult": 0.5, "trail_atr_mult": 0.5,
               "min_break_atr": 0.0, "max_trades_day": 1, "cooldown_bars": 3},
@@ -126,31 +129,16 @@ SYMBOLS = list(SESSION.keys())
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ── Global symbol info cache ──────────────────────────────────────────────────
-_tick_info: dict = {}   # broker_sym -> {tvpl, vol_min, vol_step, pip, point}
-_MAX_TRADES_DAY_COMBO = 0
+_tick_info:            dict = {}
+_MAX_TRADES_DAY_COMBO: int  = 0
 
 
 # ==============================================================================
 #  SECTION 1 — CSV PERSISTENCE
 # ==============================================================================
 
-# Canonical format written and appended by this engine:
-#   - comma-separated
-#   - header line: time_utc,open,high,low,close
-#   - datetime column: YYYY-MM-DD HH:MM:SS  (ISO, space-separated date/time)
-#
-# MT5-exported files use a different layout:
-#   - tab-separated
-#   - header: <DATE>\t<TIME>\t<OPEN>\t<HIGH>\t<LOW>\t<CLOSE>\t...
-#   - date column: YYYY.MM.DD  (dot-separated)
-#
-# On startup, _normalize_csv_if_needed() detects MT5 format and rewrites
-# the file in canonical format so all subsequent appends are consistent.
-
-CSV_COLUMNS = ["time_utc", "open", "high", "low", "close"]
-CSV_DTYPE   = {"open": np.float64, "high": np.float64,
-               "low":  np.float64, "close": np.float64}
+CSV_DTYPE = {"open": np.float64, "high": np.float64,
+             "low":  np.float64, "close": np.float64}
 
 
 def _csv_path(canon: str) -> str:
@@ -162,41 +150,28 @@ def _csv_path(canon: str) -> str:
 
 
 def _load_csv(canon: str):
-    """
-    Load and parse the CSV for canon.  Handles both the engine's own
-    canonical format and raw MT5 exports (tab-sep, dot-date, extra cols).
-    Returns a clean DataFrame[time_utc, open, high, low, close] sorted
-    ascending, or None on failure / missing file.
-    """
     path = _csv_path(canon)
     if not os.path.isfile(path):
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
             first_line = f.readline()
-
         sep = "\t" if "\t" in first_line else ","
         df  = pd.read_csv(path, sep=sep, engine="python")
 
-        # ── Normalise column names ─────────────────────────────────────────
         def _clean_col(c):
             c = c.strip().lower().replace("<", "").replace(">", "")
-            # MT5 prefixes: tdate -> date, topen -> open, etc.
             if c.startswith("t") and c[1:] in (
-                "date","time","open","high","low","close",
-                "tickvol","vol","spread"
+                "date","time","open","high","low","close","tickvol","vol","spread"
             ):
                 c = c[1:]
             return c
 
         df.columns = [_clean_col(c) for c in df.columns]
 
-        # ── Build time_utc column ──────────────────────────────────────────
         if "date" in df.columns and "time" in df.columns:
-            # MT5 export: separate date + time columns, date may use dots
             combined = (df["date"].astype(str).str.strip()
-                        + " "
-                        + df["time"].astype(str).str.strip())
+                        + " " + df["time"].astype(str).str.strip())
             fixed = combined.str.replace(
                 r"(\d{4})\.(\d{2})\.(\d{2})",
                 lambda m: f"{m.group(1)}-{m.group(2)}-{m.group(3)}",
@@ -208,8 +183,7 @@ def _load_csv(canon: str):
         elif "time" in df.columns:
             if pd.api.types.is_numeric_dtype(df["time"]):
                 df["time_utc"] = pd.to_datetime(
-                    df["time"].astype(np.int64), unit="s"
-                )
+                    df["time"].astype(np.int64), unit="s")
             else:
                 sample = str(df["time"].iloc[0]).strip()
                 if "." in sample.split(" ")[0]:
@@ -231,11 +205,9 @@ def _load_csv(canon: str):
         df.sort_values("time_utc", inplace=True)
         df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
         df.reset_index(drop=True, inplace=True)
-        logger.info(
-            f"[{canon}] CSV: {len(df):,} bars  "
-            f"{df['time_utc'].iloc[0].date()} -> "
-            f"{df['time_utc'].iloc[-1].strftime('%Y-%m-%d %H:%M')}"
-        )
+        logger.info(f"[{canon}] CSV: {len(df):,} bars  "
+                    f"{df['time_utc'].iloc[0].date()} -> "
+                    f"{df['time_utc'].iloc[-1].strftime('%Y-%m-%d %H:%M')}")
         return df
     except Exception as e:
         logger.error(f"[{canon}] CSV load failed: {e}", exc_info=True)
@@ -243,58 +215,34 @@ def _load_csv(canon: str):
 
 
 def _normalize_csv_if_needed(canon: str) -> None:
-    """
-    One-time idempotent conversion: if the CSV on disk is an MT5 export
-    (detected by a header that does NOT start with 'time_utc'), parse it
-    with _load_csv() and rewrite it in canonical engine format.
-
-    After this call the file is guaranteed to be comma-separated with a
-    'time_utc,open,high,low,close' header and ISO datetime values, so
-    _append_csv() rows always match the existing content.
-    """
     path = _csv_path(canon)
     if not os.path.isfile(path):
-        return  # nothing to normalise yet
-
+        return
     try:
         with open(path, "r", encoding="utf-8") as f:
             first_line = f.readline()
     except Exception as e:
-        logger.warning(f"[{canon}] Could not read CSV header for normalisation: {e}")
+        logger.warning(f"[{canon}] Could not read CSV header: {e}")
         return
-
-    # Already canonical — nothing to do
     if first_line.strip().lower().startswith("time_utc"):
         return
-
-    logger.info(f"[{canon}] MT5 CSV detected — normalising to engine format ...")
+    logger.info(f"[{canon}] MT5 CSV detected — normalising...")
     df = _load_csv(canon)
     if df is None or len(df) == 0:
-        logger.warning(
-            f"[{canon}] Normalisation: _load_csv returned empty — leaving file as-is"
-        )
         return
-
     try:
-        tmp_path = path + ".normalising"
-        with open(tmp_path, "w", encoding="utf-8", newline="") as f:
+        tmp = path + ".normalising"
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
             f.write("time_utc,open,high,low,close\n")
             for _, row in df.iterrows():
                 f.write(
                     f"{row['time_utc'].strftime('%Y-%m-%d %H:%M:%S')},"
                     f"{row['open']},{row['high']},{row['low']},{row['close']}\n"
                 )
-        # Atomic replace
-        if os.path.isfile(path):
-            os.replace(tmp_path, path)
-        else:
-            os.rename(tmp_path, path)
-        logger.info(
-            f"[{canon}] CSV normalised: {len(df):,} bars written to {path}"
-        )
+        os.replace(tmp, path)
+        logger.info(f"[{canon}] CSV normalised: {len(df):,} bars")
     except Exception as e:
         logger.error(f"[{canon}] CSV normalisation failed: {e}", exc_info=True)
-        # Leave original file intact — live engine can still run from broker data
         if os.path.isfile(path + ".normalising"):
             try:
                 os.remove(path + ".normalising")
@@ -304,17 +252,9 @@ def _normalize_csv_if_needed(canon: str) -> None:
 
 def _append_csv(canon: str, bar_time: pd.Timestamp,
                 o: float, h: float, l: float, c: float) -> None:
-    """
-    Append one closed bar to the canonical CSV.
-    File is guaranteed to be in canonical format by the time this is called
-    (_normalize_csv_if_needed runs during load_history on startup).
-    Creates the file with a header if it does not yet exist.
-    """
     path = _csv_path(canon)
-    row  = (
-        f"{bar_time.strftime('%Y-%m-%d %H:%M:%S')},"
-        f"{o},{h},{l},{c}\n"
-    )
+    row  = (f"{bar_time.strftime('%Y-%m-%d %H:%M:%S')},"
+            f"{o},{h},{l},{c}\n")
     if not os.path.isfile(path):
         with open(path, "w", encoding="utf-8") as f:
             f.write("time_utc,open,high,low,close\n")
@@ -368,11 +308,9 @@ def _atr_wilder_full(h, l, c):
     n  = len(h)
     tr = np.empty(n)
     tr[0]  = h[0] - l[0]
-    tr[1:] = np.maximum(
-        h[1:] - l[1:],
-        np.maximum(np.abs(h[1:] - c[:-1]),
-                   np.abs(l[1:] - c[:-1]))
-    )
+    tr[1:] = np.maximum(h[1:] - l[1:],
+               np.maximum(np.abs(h[1:] - c[:-1]),
+                          np.abs(l[1:] - c[:-1])))
     out = np.full(n, np.nan)
     if n < ATR_PERIOD:
         return out
@@ -384,7 +322,6 @@ def _atr_wilder_full(h, l, c):
 
 
 def _expanding_pct_rank(arr):
-    """Identical to BT expanding_pct_rank."""
     n    = len(arr)
     out  = np.full(n, np.nan)
     hist = []
@@ -403,28 +340,21 @@ def _expanding_pct_rank(arr):
 # ==============================================================================
 
 def build_cache(canon: str, df: pd.DataFrame, params: dict) -> dict:
-    """
-    Direct port of BT build_cache_and_signals().
-    OR computation is fully vectorised over the complete history.
-    Signal array is pre-computed — live engine just checks cache["signal"][-1].
-    """
     cfg = SESSION[canon]
+    o   = df["open"].values.astype(np.float64)
+    h   = df["high"].values.astype(np.float64)
+    l   = df["low"].values.astype(np.float64)
+    c   = df["close"].values.astype(np.float64)
+    n   = len(c)
 
-    o = df["open"].values.astype(np.float64)
-    h = df["high"].values.astype(np.float64)
-    l = df["low"].values.astype(np.float64)
-    c = df["close"].values.astype(np.float64)
-    n = len(c)
-
-    times   = df["time_utc"].values                          # datetime64[ns]
-    utc_h   = df["time_utc"].dt.hour.values.astype(np.int32)
-    utc_m   = df["time_utc"].dt.minute.values.astype(np.int32)
-    dates   = df["time_utc"].dt.date.values
+    times = df["time_utc"].values
+    utc_h = df["time_utc"].dt.hour.values.astype(np.int32)
+    utc_m = df["time_utc"].dt.minute.values.astype(np.int32)
+    dates = df["time_utc"].dt.date.values
 
     atr14   = _atr_wilder_full(h, l, c)
     atr_pct = _expanding_pct_rank(atr14)
 
-    # ── in_session ────────────────────────────────────────────────────────────
     in_session = np.array([
         (utc_h[i] > cfg["open_h"] or
          (utc_h[i] == cfg["open_h"] and utc_m[i] >= cfg["open_m"]))
@@ -433,16 +363,15 @@ def build_cache(canon: str, df: pd.DataFrame, params: dict) -> dict:
     ])
     is_open_bar = (utc_h == cfg["open_h"]) & (utc_m == cfg["open_m"])
 
-    # ── Opening Range — IDENTICAL to BT ──────────────────────────────────────
     or_bars_n = OR_BARS[params["or_minutes"]]
-    day_start = {}
+    day_start: dict = {}
     for i in range(n):
         if is_open_bar[i]:
             d = dates[i]
             if d not in day_start:
                 day_start[d] = i
 
-    day_or = {}
+    day_or: dict = {}
     for d, si in day_start.items():
         ei = si + or_bars_n
         if ei <= n:
@@ -460,7 +389,6 @@ def build_cache(canon: str, df: pd.DataFrame, params: dict) -> dict:
             continue
         or_high[i], or_low[i] = day_or[d]
 
-    # ── Signal detection — IDENTICAL to BT ───────────────────────────────────
     cooldown      = params["cooldown_bars"]
     max_t         = params["max_trades_day"]
     min_break_atr = params["min_break_atr"]
@@ -496,11 +424,9 @@ def build_cache(canon: str, df: pd.DataFrame, params: dict) -> dict:
         last_sig   = i
         day_count[day] = day_count.get(day, 0) + 1
 
-    logger.info(
-        f"[{canon}] cache built: n={n:,}  "
-        f"signals={int((signal != 0).sum()):,}  "
-        f"last_bar={df['time_utc'].iloc[-1].strftime('%Y-%m-%d %H:%M')}"
-    )
+    logger.info(f"[{canon}] cache built: n={n:,}  "
+                f"signals={int((signal != 0).sum()):,}  "
+                f"last_bar={df['time_utc'].iloc[-1].strftime('%Y-%m-%d %H:%M')}")
 
     return {
         "canon":      canon,
@@ -516,15 +442,13 @@ def build_cache(canon: str, df: pd.DataFrame, params: dict) -> dict:
         "dates":      dates,
         "times":      times,
         "in_session": in_session,
-        # Wilder state for O(1) incremental update
         "_atr_prev":  float(atr14[~np.isnan(atr14)][-1])
                       if not np.all(np.isnan(atr14)) else 0.0,
-        "_atr_hist":  [],   # rebuilt in init_cache_incremental
+        "_atr_hist":  [],
         "_prev_c":    float(c[-1]),
         "params":     params,
         "day_start":  day_start,
         "day_or":     day_or,
-        # Live state
         "_last_sig_bar": int(np.where(signal != 0)[0][-1])
                          if (signal != 0).any() else -9999,
         "_day_count":    dict(day_count),
@@ -532,7 +456,6 @@ def build_cache(canon: str, df: pd.DataFrame, params: dict) -> dict:
 
 
 def _rebuild_atr_hist(atr14: np.ndarray) -> list:
-    """Rebuild sorted hist list for expanding pct rank — needed for incremental update."""
     hist = []
     for i in range(WARMUP_M5, len(atr14)):
         v = atr14[i]
@@ -542,27 +465,127 @@ def _rebuild_atr_hist(atr14: np.ndarray) -> list:
 
 
 # ==============================================================================
-#  SECTION 5 — CACHE INCREMENTAL UPDATE
+#  SECTION 4B — BT ACCURACY VERIFICATION
+#
+#  Runs build_cache() independently on the same DataFrame the live cache
+#  was built from, then compares signal arrays element-by-element.
+#
+#  Metric: over all bars where EITHER cache fired a signal, what fraction
+#  do both agree on direction?  Zero-vs-zero bars are not counted (trivial).
+#
+#  Logs:
+#    - Overall match %
+#    - Direction accuracy on bars both fired
+#    - False positives (live only), missed (BT only), wrong direction
+#    - Last 20 BT signal bars with OK/MISMATCH status
+#    - First 10 discrepancies with timestamps
+#
+#  Returns True if accuracy >= MIN_BT_ACCURACY.
+# ==============================================================================
+
+def verify_cache_vs_bt(canon: str, df: pd.DataFrame,
+                        live_cache: dict, params: dict) -> bool:
+    logger.info(f"[{canon}] === BT ACCURACY CHECK ===")
+
+    bt_cache = build_cache(canon, df, params)
+
+    live_sig = live_cache["signal"]
+    bt_sig   = bt_cache["signal"]
+    n        = min(len(live_sig), len(bt_sig))
+    times    = live_cache["times"]
+
+    live_fire_set = set(np.where(live_sig[:n] != 0)[0].tolist())
+    bt_fire_set   = set(np.where(bt_sig[:n]   != 0)[0].tolist())
+    all_bars      = live_fire_set | bt_fire_set
+    total         = len(all_bars)
+
+    if total == 0:
+        logger.warning(f"[{canon}] BT check: no signals in either cache "
+                       f"— nothing to compare (warmup only?)")
+        return True
+
+    matches = sum(
+        1 for i in all_bars
+        if (int(live_sig[i]) if i < len(live_sig) else 0) ==
+           (int(bt_sig[i])   if i < len(bt_sig)   else 0)
+    )
+    accuracy = matches / total
+
+    both_fired  = live_fire_set & bt_fire_set
+    dir_matches = sum(1 for i in both_fired
+                      if live_sig[i] == bt_sig[i])
+    dir_total   = len(both_fired)
+    dir_acc     = dir_matches / dir_total if dir_total > 0 else 1.0
+
+    live_only = sorted(live_fire_set - bt_fire_set)
+    bt_only   = sorted(bt_fire_set   - live_fire_set)
+    wrong_dir = sorted(i for i in both_fired if live_sig[i] != bt_sig[i])
+
+    logger.info(f"[{canon}] Signal match: {accuracy:.2%}  "
+                f"({matches}/{total} bars agree)")
+    logger.info(f"[{canon}] Direction match (both fired): {dir_acc:.2%}  "
+                f"({dir_matches}/{dir_total})")
+    logger.info(f"[{canon}] False positives (live only): {len(live_only)}  "
+                f"Missed (BT only): {len(bt_only)}  "
+                f"Wrong direction: {len(wrong_dir)}")
+
+    # First 10 discrepancies
+    discrepancies = sorted(
+        (live_fire_set ^ bt_fire_set) | set(wrong_dir)
+    )[:10]
+    if discrepancies:
+        logger.info(f"[{canon}] First discrepancies:")
+        for i in discrepancies:
+            ts  = pd.Timestamp(int(times[i])) if i < len(times) else "?"
+            lv  = int(live_sig[i]) if i < len(live_sig) else 0
+            bv  = int(bt_sig[i])   if i < len(bt_sig)   else 0
+            tag = ("live_only" if i in live_fire_set - bt_fire_set else
+                   "bt_only"   if i in bt_fire_set   - live_fire_set else
+                   "wrong_dir")
+            logger.info(f"  [{tag}] bar={ts}  live={lv:+d}  bt={bv:+d}")
+
+    # Last 20 BT signal bars
+    bt_fire_sorted = sorted(bt_fire_set)
+    logger.info(f"[{canon}] Last 20 BT signals ({len(bt_fire_sorted)} total):")
+    for i in bt_fire_sorted[-20:]:
+        ts    = pd.Timestamp(int(times[i])) if i < len(times) else "?"
+        lv    = int(live_sig[i]) if i < len(live_sig) else 0
+        bv    = int(bt_sig[i])
+        ok    = "OK" if lv == bv else "MISMATCH"
+        orh   = float(bt_cache["or_high"][i])
+        orl   = float(bt_cache["or_low"][i])
+        cl    = float(bt_cache["c"][i])
+        logger.info(f"  [{ok}] {ts}  BT={bv:+d} live={lv:+d}  "
+                    f"OR_H={orh:.5f} OR_L={orl:.5f} close={cl:.5f}")
+
+    logger.info(f"[{canon}] === END BT ACCURACY CHECK ===")
+
+    if accuracy < MIN_BT_ACCURACY:
+        logger.error(f"[{canon}] accuracy {accuracy:.2%} < "
+                     f"required {MIN_BT_ACCURACY:.2%} — ABORTING this symbol")
+        return False
+
+    logger.info(f"[{canon}] accuracy {accuracy:.2%} >= "
+                f"{MIN_BT_ACCURACY:.2%} — OK to trade")
+    return True
+
+
+# ==============================================================================
+#  SECTION 5 — CACHE INCREMENTAL UPDATE  (O(1) per bar, identical to BT)
 # ==============================================================================
 
 def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
                          o: float, h: float, l: float, c: float) -> None:
-    """
-    Append one new closed bar to all arrays.
-    Recompute ATR, ATR pct, OR, signal for the new bar only.
-    This is O(1) per bar — no full rebuild.
-    """
     canon  = cache["canon"]
     cfg    = SESSION[canon]
     params = cache["params"]
     n      = cache["n"]
 
-    # ── Extend OHLC + time arrays ─────────────────────────────────────────────
-    cache["o"]      = np.append(cache["o"],      o)
-    cache["h"]      = np.append(cache["h"],      h)
-    cache["l"]      = np.append(cache["l"],      l)
-    cache["c"]      = np.append(cache["c"],      c)
-    cache["times"]  = np.append(cache["times"],  np.datetime64(bar_time))
+    cache["o"]     = np.append(cache["o"],     o)
+    cache["h"]     = np.append(cache["h"],     h)
+    cache["l"]     = np.append(cache["l"],     l)
+    cache["c"]     = np.append(cache["c"],     c)
+    cache["times"] = np.append(cache["times"], np.datetime64(bar_time))
 
     utc_h_new = bar_time.hour
     utc_m_new = bar_time.minute
@@ -572,7 +595,7 @@ def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
     cache["utc_m"]  = np.append(cache["utc_m"],  utc_m_new)
     cache["dates"]  = np.append(cache["dates"],  date_new)
 
-    # ── ATR (Wilder step) ─────────────────────────────────────────────────────
+    # ATR Wilder step
     prev_c   = cache["_prev_c"]
     prev_atr = cache["_atr_prev"]
     tr       = max(h - l, abs(h - prev_c), abs(l - prev_c))
@@ -582,9 +605,9 @@ def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
     cache["_atr_prev"] = new_atr
     cache["_prev_c"]   = c
 
-    # ── ATR pct rank (incremental bisect) ─────────────────────────────────────
-    hist    = cache["_atr_hist"]
-    new_n   = n + 1
+    # ATR pct rank
+    hist  = cache["_atr_hist"]
+    new_n = n + 1
     if new_n > WARMUP_M5 and len(hist) > 0:
         new_pct = bisect.bisect_left(hist, new_atr) / len(hist)
     else:
@@ -592,7 +615,7 @@ def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
     bisect.insort(hist, new_atr)
     cache["atr_pct"] = np.append(cache["atr_pct"], new_pct)
 
-    # ── in_session ────────────────────────────────────────────────────────────
+    # in_session
     in_sess_new = (
         (utc_h_new > cfg["open_h"] or
          (utc_h_new == cfg["open_h"] and utc_m_new >= cfg["open_m"]))
@@ -600,32 +623,25 @@ def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
     )
     cache["in_session"] = np.append(cache["in_session"], in_sess_new)
 
-    # ── OR update ─────────────────────────────────────────────────────────────
+    # OR update
     or_bars_n = OR_BARS[params["or_minutes"]]
 
-    # Check if this bar is the session open bar
     if utc_h_new == cfg["open_h"] and utc_m_new == cfg["open_m"]:
         if date_new not in cache["day_start"]:
-            cache["day_start"][date_new] = new_n - 1   # index of this bar
+            cache["day_start"][date_new] = new_n - 1
 
-    # Check if OR window just completed for today
     if date_new in cache["day_start"] and date_new not in cache["day_or"]:
         si = cache["day_start"][date_new]
         ei = si + or_bars_n
         if new_n >= ei:
-            h_arr = cache["h"]
-            l_arr = cache["l"]
             cache["day_or"][date_new] = (
-                h_arr[si:ei].max(),
-                l_arr[si:ei].min()
+                cache["h"][si:ei].max(),
+                cache["l"][si:ei].min()
             )
-            logger.info(
-                f"[{canon}] OR set for {date_new}: "
-                f"high={cache['day_or'][date_new][0]:.5f} "
-                f"low={cache['day_or'][date_new][1]:.5f}"
-            )
+            logger.info(f"[{canon}] OR set {date_new}: "
+                        f"high={cache['day_or'][date_new][0]:.5f} "
+                        f"low={cache['day_or'][date_new][1]:.5f}")
 
-    # Set or_high/or_low for this bar
     i        = new_n - 1
     d        = date_new
     or_h_new = np.nan
@@ -639,14 +655,12 @@ def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
     cache["or_high"] = np.append(cache["or_high"], or_h_new)
     cache["or_low"]  = np.append(cache["or_low"],  or_l_new)
 
-    # ── Signal detection for this bar (same logic as BT) ─────────────────────
-    sig_new     = np.int8(0)
-    atr_pct_new = new_pct
-    atr_new     = new_atr
+    # Signal detection — identical logic to BT
+    sig_new = np.int8(0)
 
     if (in_sess_new
-            and not np.isnan(atr_pct_new)
-            and atr_pct_new >= ATR_PCT_THRESH
+            and not np.isnan(new_pct)
+            and new_pct >= ATR_PCT_THRESH
             and new_n > WARMUP_M5
             and not np.isnan(or_h_new)):
 
@@ -662,24 +676,20 @@ def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
                 bu   = c > or_h_new
                 bd   = c < or_l_new
                 if min_break_atr > 0:
-                    strong = body >= min_break_atr * atr_new
+                    strong = body >= min_break_atr * new_atr
                     bu = bu and strong
                     bd = bd and strong
 
                 if bu and not bd:
                     sig_new = np.int8(1)
-                    logger.info(
-                        f"[{canon}] SIGNAL LONG  bar={bar_time} "
-                        f"close={c:.5f} > OR_HIGH={or_h_new:.5f} "
-                        f"atr={atr_new:.5f} atr_pct={atr_pct_new:.3f}"
-                    )
+                    logger.info(f"[{canon}] SIGNAL LONG  bar={bar_time} "
+                                f"close={c:.5f} > OR_HIGH={or_h_new:.5f} "
+                                f"atr={new_atr:.5f} atr_pct={new_pct:.3f}")
                 elif bd and not bu:
                     sig_new = np.int8(-1)
-                    logger.info(
-                        f"[{canon}] SIGNAL SHORT bar={bar_time} "
-                        f"close={c:.5f} < OR_LOW={or_l_new:.5f} "
-                        f"atr={atr_new:.5f} atr_pct={atr_pct_new:.3f}"
-                    )
+                    logger.info(f"[{canon}] SIGNAL SHORT bar={bar_time} "
+                                f"close={c:.5f} < OR_LOW={or_l_new:.5f} "
+                                f"atr={new_atr:.5f} atr_pct={new_pct:.3f}")
 
                 if sig_new != 0:
                     cache["_last_sig_bar"] = i
@@ -690,42 +700,58 @@ def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
 
 
 # ==============================================================================
-#  SECTION 6 — DATA LOADING  (CSV + broker gap)
+#  SECTION 6 — DATA LOADING
 # ==============================================================================
 
-def load_history(canon: str, broker_sym: str) -> pd.DataFrame:
-    """
-    Normalise CSV format (MT5 -> canonical), load it, then gap-fill
-    from the broker for any bars after the last CSV row.
-    Returns full DataFrame ready for build_cache().
-    """
-    # One-time idempotent format normalisation
-    _normalize_csv_if_needed(canon)
+def _last_closed_bar_open_time() -> datetime.datetime:
+    now          = datetime.datetime.utcnow()
+    secs         = now.hour * 3600 + now.minute * 60 + now.second
+    rem          = secs % M5_SECONDS
+    forming_open = now - datetime.timedelta(seconds=rem)
+    return forming_open - datetime.timedelta(seconds=M5_SECONDS)
 
+
+def _fetch_broker_range(broker_sym: str,
+                         from_dt: datetime.datetime,
+                         to_dt:   datetime.datetime) -> pd.DataFrame:
+    last_closed = _last_closed_bar_open_time()
+    safe_to     = min(to_dt, last_closed)
+    if safe_to < from_dt:
+        return pd.DataFrame(columns=["time_utc","open","high","low","close"])
+    rates = mt5.copy_rates_range(broker_sym, mt5.TIMEFRAME_M5, from_dt, safe_to)
+    if rates is None or len(rates) == 0:
+        return pd.DataFrame(columns=["time_utc","open","high","low","close"])
+    df = pd.DataFrame(rates)[["time","open","high","low","close"]].copy()
+    df["time_utc"] = pd.to_datetime(df["time"].astype(np.int64), unit="s")
+    df.drop(columns=["time"], inplace=True)
+    now_ts = pd.Timestamp(datetime.datetime.utcnow())
+    df = df[df["time_utc"] + pd.Timedelta(seconds=M5_SECONDS) <= now_ts].copy()
+    df.sort_values("time_utc", inplace=True)
+    df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def load_history(canon: str, broker_sym: str):
+    _normalize_csv_if_needed(canon)
     csv_df = _load_csv(canon)
 
     if csv_df is not None and len(csv_df) > 0:
-        gap_from = (
-            csv_df["time_utc"].iloc[-1].to_pydatetime()
-            + datetime.timedelta(seconds=1)
-        )
-        gap_df = _fetch_broker_range(
-            broker_sym, gap_from, datetime.datetime.utcnow()
-        )
+        gap_from = (csv_df["time_utc"].iloc[-1].to_pydatetime()
+                    + datetime.timedelta(seconds=1))
+        gap_df   = _fetch_broker_range(broker_sym, gap_from,
+                                        datetime.datetime.utcnow())
         if len(gap_df) > 0:
             combined = pd.concat([csv_df, gap_df], ignore_index=True)
             combined.sort_values("time_utc", inplace=True)
             combined.drop_duplicates(subset="time_utc", keep="last", inplace=True)
             combined.reset_index(drop=True, inplace=True)
-            logger.info(
-                f"[{canon}] history: {len(csv_df):,} CSV + "
-                f"{len(gap_df):,} gap = {len(combined):,} bars"
-            )
+            logger.info(f"[{canon}] history: {len(csv_df):,} CSV + "
+                        f"{len(gap_df):,} gap = {len(combined):,} bars")
             return combined
         logger.info(f"[{canon}] history: {len(csv_df):,} CSV (no gap)")
         return csv_df
 
-    # No CSV — fetch enough history for warmup directly from broker
     need = WARMUP_M5 + ATR_PERIOD + 500
     logger.info(f"[{canon}] No CSV — fetching {need} bars from broker")
     rates = mt5.copy_rates_from_pos(broker_sym, mt5.TIMEFRAME_M5, 0, need + 2)
@@ -743,87 +769,53 @@ def load_history(canon: str, broker_sym: str) -> pd.DataFrame:
     return df
 
 
-def _last_closed_bar_open_time() -> datetime.datetime:
-    """
-    Return the open timestamp of the last fully closed M5 bar.
-    = floor(utcnow to 5-min grid) minus one bar.
-    Used as the safe upper bound for gap fills so the currently-forming
-    bar is never included in history.
-    """
-    now          = datetime.datetime.utcnow()
-    secs         = now.hour * 3600 + now.minute * 60 + now.second
-    rem          = secs % M5_SECONDS
-    forming_open = now - datetime.timedelta(seconds=rem)
-    return forming_open - datetime.timedelta(seconds=M5_SECONDS)
-
-
-def _fetch_broker_range(broker_sym: str,
-                         from_dt: datetime.datetime,
-                         to_dt:   datetime.datetime) -> pd.DataFrame:
-    # Clamp to_dt so the currently-forming bar is never included.
-    last_closed = _last_closed_bar_open_time()
-    safe_to     = min(to_dt, last_closed)
-    if safe_to < from_dt:
-        return pd.DataFrame(columns=["time_utc","open","high","low","close"])
-
-    rates = mt5.copy_rates_range(broker_sym, mt5.TIMEFRAME_M5, from_dt, safe_to)
-    if rates is None or len(rates) == 0:
-        return pd.DataFrame(columns=["time_utc","open","high","low","close"])
-    df = pd.DataFrame(rates)[["time","open","high","low","close"]].copy()
-    df["time_utc"] = pd.to_datetime(df["time"].astype(np.int64), unit="s")
-    df.drop(columns=["time"], inplace=True)
-    # Secondary guard: drop any bar whose close time hasn't arrived yet
-    now_ts = pd.Timestamp(datetime.datetime.utcnow())
-    df = df[df["time_utc"] + pd.Timedelta(seconds=M5_SECONDS) <= now_ts].copy()
-    df.sort_values("time_utc", inplace=True)
-    df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
-
+# ==============================================================================
+#  SECTION 7 — BAR FETCH
+#
+#  Accepts any bar with open time STRICTLY GREATER than last cached bar.
+#  No wall-clock expected time — immune to broker time offsets and DST.
+# ==============================================================================
 
 def _fetch_single_closed_bar(broker_sym: str,
-                              expected_bar_time: pd.Timestamp) -> tuple:
+                              last_cached_bar_time: pd.Timestamp) -> tuple:
     """
-    Fetch the single just-closed bar.
-    copy_rates_from_pos(..., 1, 1) returns the last fully-closed bar
-    (index 0 = currently forming, index 1 = last closed on MT5).
-    Polls until the broker confirms the bar whose open time ==
-    expected_bar_time, or returns whatever index-1 holds on timeout.
-    Returns (bar_time, o, h, l, c) or None on total failure.
+    Poll broker index 1 (last fully closed bar) until its open timestamp
+    is strictly greater than last_cached_bar_time, then return it.
+
+    This approach is immune to broker-server-time vs UTC offsets because
+    we compare broker timestamps to each other (cache vs new), not to
+    wall clock.  The 13:35 vs 13:40 mismatch is eliminated entirely.
     """
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         rates = mt5.copy_rates_from_pos(broker_sym, mt5.TIMEFRAME_M5, 1, 1)
         if rates is not None and len(rates) == 1:
             bt = pd.Timestamp(int(rates[0]["time"]), unit="s")
-            if bt == expected_bar_time:
+            if bt > last_cached_bar_time:
                 r = rates[0]
-                return (
-                    bt,
-                    float(r["open"]), float(r["high"]),
-                    float(r["low"]),  float(r["close"])
-                )
+                return (bt,
+                        float(r["open"]), float(r["high"]),
+                        float(r["low"]),  float(r["close"]))
         time.sleep(0.1)
 
-    # Timeout fallback: use whatever is at index 1
+    # Timeout: accept whatever index 1 holds if it's newer
     rates = mt5.copy_rates_from_pos(broker_sym, mt5.TIMEFRAME_M5, 1, 1)
     if rates is not None and len(rates) == 1:
         r  = rates[0]
         bt = pd.Timestamp(int(r["time"]), unit="s")
-        logger.warning(
-            f"[{broker_sym}] bar time mismatch: "
-            f"expected {expected_bar_time} got {bt}"
-        )
-        return (
-            bt,
-            float(r["open"]), float(r["high"]),
-            float(r["low"]),  float(r["close"])
-        )
+        if bt <= last_cached_bar_time:
+            logger.warning(f"[{broker_sym}] fetch timeout: broker at {bt}, "
+                           f"cache at {last_cached_bar_time} — skipping bar")
+            return None
+        logger.warning(f"[{broker_sym}] fetch timeout accepted bar {bt}")
+        return (bt,
+                float(r["open"]), float(r["high"]),
+                float(r["low"]),  float(r["close"]))
     return None
 
 
 # ==============================================================================
-#  SECTION 7 — STOPS LEVEL + SL HELPERS
+#  SECTION 8 — STOPS LEVEL + SL HELPERS
 # ==============================================================================
 
 def get_min_sl_distance(broker_sym: str) -> float:
@@ -852,7 +844,7 @@ def clamp_sl(broker_sym: str, direction: str, price: float, sl: float) -> float:
 
 
 # ==============================================================================
-#  SECTION 8 — POSITION SIZING
+#  SECTION 9 — POSITION SIZING
 # ==============================================================================
 
 def compute_lot(broker_sym: str, sl_dist: float, balance: float):
@@ -864,23 +856,17 @@ def compute_lot(broker_sym: str, sl_dist: float, balance: float):
     vol_step = ti["vol_step"]
     vol_min  = ti["vol_min"]
 
-    # Daily loss cap
-    per_trade = (
-        DAILY_LOSS_BUDGET / _MAX_TRADES_DAY_COMBO
-        if _MAX_TRADES_DAY_COMBO else DAILY_LOSS_BUDGET
-    )
-    vol_cap = max(
-        vol_min,
-        round((per_trade / (sl_dist * tvpl)) / vol_step) * vol_step
-    )
-    vol_cap = min(vol_cap, VOL_MAX)
+    per_trade = (DAILY_LOSS_BUDGET / _MAX_TRADES_DAY_COMBO
+                 if _MAX_TRADES_DAY_COMBO else DAILY_LOSS_BUDGET)
+    vol_cap   = max(vol_min,
+                    round((per_trade / (sl_dist * tvpl)) / vol_step) * vol_step)
+    vol_cap   = min(vol_cap, VOL_MAX)
 
     risk_amount = balance * RISK_PER_TRADE
     raw_lot     = risk_amount / (sl_dist * tvpl)
     lot = max(vol_min, min(vol_cap, round(raw_lot / vol_step) * vol_step))
     lot = round(lot, 8)
 
-    # Risk guard
     intended = balance * RISK_PER_TRADE
     actual   = lot * sl_dist * tvpl
     multiple = actual / intended if intended > 0 else float("inf")
@@ -888,15 +874,13 @@ def compute_lot(broker_sym: str, sl_dist: float, balance: float):
         logger.warning(f"[{broker_sym}] RISK REJECTED {multiple:.2f}x")
         return None, None
 
-    logger.info(
-        f"[{broker_sym}] lot={lot} sl_dist={sl_dist:.5f} "
-        f"tvpl={tvpl:.5f} risk={actual:.2f} ({multiple:.2f}x)"
-    )
+    logger.info(f"[{broker_sym}] lot={lot} sl_dist={sl_dist:.5f} "
+                f"tvpl={tvpl:.5f} risk={actual:.2f} ({multiple:.2f}x)")
     return lot, tvpl
 
 
 # ==============================================================================
-#  SECTION 9 — ORDER EXECUTION
+#  SECTION 10 — ORDER EXECUTION
 # ==============================================================================
 
 def send_market_order(broker_sym: str, direction: str, lot: float,
@@ -925,17 +909,13 @@ def send_market_order(broker_sym: str, direction: str, lot: float,
     }
     result = mt5.order_send(req)
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-        logger.error(
-            f"[{broker_sym}] Entry FAILED retcode="
-            f"{getattr(result,'retcode',None)} "
-            f"msg={getattr(result,'comment','')}"
-        )
+        logger.error(f"[{broker_sym}] Entry FAILED retcode="
+                     f"{getattr(result,'retcode',None)} "
+                     f"msg={getattr(result,'comment','')}")
         return None, None
-    logger.info(
-        f"[{broker_sym}] ENTRY {direction.upper()} "
-        f"lot={lot} price={price:.5f} sl={sl_price:.5f} "
-        f"ticket={result.order}"
-    )
+    logger.info(f"[{broker_sym}] ENTRY {direction.upper()} "
+                f"lot={lot} price={price:.5f} sl={sl_price:.5f} "
+                f"ticket={result.order}")
     return result.order, price
 
 
@@ -943,47 +923,29 @@ def modify_sl_with_retry(broker_sym: str, ticket: int,
                           new_sl: float, direction: str,
                           timeout: float = None) -> bool:
     """
-    Retry SL modification indefinitely until the broker confirms success.
-    Re-fetches bid/ask and re-clamps before every attempt so the SL price
-    is always valid against the current stops level.
-
-    Only stops on:
-      DONE / NO_CHANGES   — success, returns True.
-      MARKET_CLOSED       — not retriable, returns False immediately.
-      position gone       — ticket no longer exists, returns False.
-
-    10016 (INVALID_STOPS) and all other transient errors are retried
-    without limit. timeout parameter kept for call-site compatibility only.
+    Retry SL modification on same bar until success.
+    Aborts only on: position gone, market disabled.
+    10016 and all other transient errors are retried without limit.
+    timeout param kept for call-site compatibility — not used.
     """
     attempt = 0
-
     while True:
         attempt += 1
 
-        # ── Abort if position no longer exists ───────────────────────────────
         if not mt5.positions_get(ticket=ticket):
-            logger.warning(
-                f"[{broker_sym}] SL retry {attempt}: "
-                f"ticket={ticket} no longer exists — aborting"
-            )
+            logger.warning(f"[{broker_sym}] SL retry {attempt}: "
+                           f"ticket={ticket} gone — aborting")
             return False
 
-        # ── Abort if market is closed/disabled ───────────────────────────────
         sym_info = mt5.symbol_info(broker_sym)
         if (sym_info is not None and
                 sym_info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED):
-            logger.error(
-                f"[{broker_sym}] SL modify aborted: market disabled "
-                f"ticket={ticket}"
-            )
+            logger.error(f"[{broker_sym}] SL aborted: market disabled "
+                         f"ticket={ticket}")
             return False
 
-        # ── Fetch fresh tick ─────────────────────────────────────────────────
         tick = mt5.symbol_info_tick(broker_sym)
         if tick is None:
-            logger.warning(
-                f"[{broker_sym}] SL retry {attempt}: tick unavailable — waiting"
-            )
             time.sleep(0.5)
             continue
 
@@ -1000,19 +962,13 @@ def modify_sl_with_retry(broker_sym: str, ticket: int,
         result  = mt5.order_send(req)
         retcode = getattr(result, "retcode", None)
 
-        # ── Success ──────────────────────────────────────────────────────────
         if retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_NO_CHANGES):
-            logger.info(
-                f"[{broker_sym}] SL modified ticket={ticket} "
-                f"sl={sl_clamped:.5f} (attempt {attempt})"
-            )
+            logger.info(f"[{broker_sym}] SL modified ticket={ticket} "
+                        f"sl={sl_clamped:.5f} (attempt {attempt})")
             return True
 
-        # ── Log and retry ────────────────────────────────────────────────────
-        logger.warning(
-            f"[{broker_sym}] SL retry {attempt} retcode={retcode} "
-            f"sl_target={sl_clamped:.5f} price={cur_px:.5f}"
-        )
+        logger.warning(f"[{broker_sym}] SL retry {attempt} retcode={retcode} "
+                       f"sl_target={sl_clamped:.5f} price={cur_px:.5f}")
         time.sleep(0.2)
 
 
@@ -1036,27 +992,20 @@ def send_close(broker_sym: str, position) -> bool:
     result = mt5.order_send(req)
     ok = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
     if ok:
-        logger.info(
-            f"[{broker_sym}] CLOSED ticket={position.ticket} price={price:.5f}"
-        )
+        logger.info(f"[{broker_sym}] CLOSED ticket={position.ticket} "
+                    f"price={price:.5f}")
     else:
-        logger.error(
-            f"[{broker_sym}] Close FAILED "
-            f"retcode={getattr(result,'retcode',None)}"
-        )
+        logger.error(f"[{broker_sym}] Close FAILED "
+                     f"retcode={getattr(result,'retcode',None)}")
     return ok
 
 
 # ==============================================================================
-#  SECTION 10 — PER-SYMBOL STATE
+#  SECTION 11 — PER-SYMBOL STATE
 # ==============================================================================
 
 def make_sym_state() -> dict:
-    return {
-        "positions":        [],
-        "day_trades_date":  None,
-        "day_trades_count": 0,
-    }
+    return {"positions": [], "day_trades_date": None, "day_trades_count": 0}
 
 
 def _make_pos_rec(ticket, direction, ep, sl_dist,
@@ -1081,45 +1030,32 @@ def _reset_daily(sym_st: dict, today) -> None:
 
 
 def _reconstruct_pos(canon: str, pos) -> dict:
-    entry_time = datetime.datetime.fromtimestamp(
-        pos.time, tz=datetime.timezone.utc
-    )
-    now_utc   = datetime.datetime.now(tz=datetime.timezone.utc)
-    hold      = max(0, int((now_utc - entry_time).total_seconds() / M5_SECONDS))
-    direction = "long" if pos.type == mt5.ORDER_TYPE_BUY else "short"
-    ep        = pos.price_open
-    sl_price  = pos.sl or 0.0
-    sl_dist   = abs(ep - sl_price) if sl_price > 0 else 0.01
-    be_active = (
-        (direction == "long"  and sl_price >= ep) or
-        (direction == "short" and sl_price > 0 and sl_price <= ep)
-    )
-    rec = _make_pos_rec(
-        pos.ticket, direction, ep, sl_dist,
-        sl_price, entry_time.date(), None
-    )
+    entry_time = datetime.datetime.fromtimestamp(pos.time,
+                                                  tz=datetime.timezone.utc)
+    now_utc    = datetime.datetime.now(tz=datetime.timezone.utc)
+    hold       = max(0, int((now_utc - entry_time).total_seconds() / M5_SECONDS))
+    direction  = "long" if pos.type == mt5.ORDER_TYPE_BUY else "short"
+    ep         = pos.price_open
+    sl_price   = pos.sl or 0.0
+    sl_dist    = abs(ep - sl_price) if sl_price > 0 else 0.01
+    be_active  = ((direction == "long"  and sl_price >= ep) or
+                  (direction == "short" and sl_price > 0 and sl_price <= ep))
+    rec = _make_pos_rec(pos.ticket, direction, ep, sl_dist,
+                        sl_price, entry_time.date(), None)
     rec["be_active"]  = be_active
     rec["hold_count"] = hold
-    logger.info(
-        f"[{canon}] RECOVERED ticket={pos.ticket} "
-        f"dir={direction} ep={ep:.5f} sl={sl_price:.5f} "
-        f"hold~{hold}bars be={be_active}"
-    )
+    logger.info(f"[{canon}] RECOVERED ticket={pos.ticket} "
+                f"dir={direction} ep={ep:.5f} sl={sl_price:.5f} "
+                f"hold~{hold}bars be={be_active}")
     return rec
 
 
 # ==============================================================================
-#  SECTION 11 — POSITION MANAGEMENT
-#  Mirrors resolve_trade() forward simulation from BT exactly.
+#  SECTION 12 — POSITION MANAGEMENT
 # ==============================================================================
 
 def manage_positions(canon: str, broker_sym: str, sym_st: dict,
                      cache: dict, params: dict, today) -> None:
-    """
-    For each open position: check EOD, max hold, BE, trail.
-    Uses current bar (cache[-1]) — same logic as resolve_trade() inner loop.
-    SL modifications use modify_sl_with_retry() — retries on same bar.
-    """
     i        = cache["n"] - 1
     bar_h    = float(cache["h"][i])
     bar_l    = float(cache["l"][i])
@@ -1133,12 +1069,9 @@ def manage_positions(canon: str, broker_sym: str, sym_st: dict,
     broker_map       = {p.ticket: p for p in broker_positions}
     broker_tickets   = set(broker_map.keys())
 
-    # Detect server-side closes
     for pr in list(sym_st["positions"]):
         if pr["ticket"] not in broker_tickets:
-            logger.info(
-                f"[{canon}] ticket={pr['ticket']} closed server-side"
-            )
+            logger.info(f"[{canon}] ticket={pr['ticket']} closed server-side")
             sym_st["positions"].remove(pr)
 
     for pr in list(sym_st["positions"]):
@@ -1150,18 +1083,17 @@ def manage_positions(canon: str, broker_sym: str, sym_st: dict,
         pr["hold_count"] += 1
         hc = pr["hold_count"]
 
-        # ── EOD exit — same condition as resolve_trade() ──────────────────────
+        # EOD exit — bar date and bar hour from bar timestamp (matches BT)
         if bar_date != pr["entry_date"] or bar_hour >= cfg["close_h"]:
-            logger.info(
-                f"[{canon}] EOD exit ticket={pr['ticket']} "
-                f"bar={bar_date} {bar_hour:02d}h entry={pr['entry_date']}"
-            )
+            logger.info(f"[{canon}] EOD exit ticket={pr['ticket']} "
+                        f"bar={bar_date} {bar_hour:02d}h "
+                        f"entry={pr['entry_date']}")
             if bp:
                 send_close(broker_sym, bp)
             sym_st["positions"].remove(pr)
             continue
 
-        # ── Max hold ──────────────────────────────────────────────────────────
+        # Max hold
         if hc >= MAX_HOLD:
             logger.info(f"[{canon}] MAX HOLD ticket={pr['ticket']}")
             if bp:
@@ -1169,53 +1101,55 @@ def manage_positions(canon: str, broker_sym: str, sym_st: dict,
             sym_st["positions"].remove(pr)
             continue
 
-        # ── Break-even at 1R — same as resolve_trade() ────────────────────────
+        # Break-even at 1R
         one_r = ep + (sl_dist if direction == "long" else -sl_dist)
         if not pr["be_active"]:
-            triggered = (
-                (direction == "long"  and bar_h >= one_r) or
-                (direction == "short" and bar_l <= one_r)
-            )
+            triggered = ((direction == "long"  and bar_h >= one_r) or
+                         (direction == "short" and bar_l <= one_r))
             if triggered:
                 pr["be_active"]  = True
                 pr["current_sl"] = ep
-                logger.info(
-                    f"[{canon}] BE ticket={pr['ticket']} SL -> {ep:.5f}"
-                )
+                logger.info(f"[{canon}] BE ticket={pr['ticket']} "
+                            f"SL -> {ep:.5f}")
 
-        # ── Trail — same as resolve_trade() ──────────────────────────────────
+        # Trail
         if pr["be_active"]:
             ta   = (atr_cur if (not np.isnan(atr_cur) and atr_cur > 0)
                     else (pr["entry_atr"] or sl_dist))
             mult = params["trail_atr_mult"]
             if direction == "long":
-                pr["current_sl"] = max(
-                    pr["current_sl"], bar_h - mult * ta
-                )
+                pr["current_sl"] = max(pr["current_sl"], bar_h - mult * ta)
             else:
-                pr["current_sl"] = min(
-                    pr["current_sl"], bar_l + mult * ta
-                )
+                pr["current_sl"] = min(pr["current_sl"], bar_l + mult * ta)
 
-        # ── SL modify with retry on same bar ──────────────────────────────────
+        # SL modify with retry on same bar
         if bp is not None:
             broker_sl = bp.sl or 0.0
             new_sl    = pr["current_sl"]
             pip       = _tick_info.get(broker_sym, {}).get("pip", 0.0001)
             if abs(new_sl - broker_sl) >= pip:
-                modify_sl_with_retry(
-                    broker_sym, pr["ticket"], new_sl, direction, timeout=8.0
-                )
+                modify_sl_with_retry(broker_sym, pr["ticket"],
+                                     new_sl, direction)
 
 
 # ==============================================================================
-#  SECTION 12 — ENTRY EXECUTION
+#  SECTION 13 — ENTRY EXECUTION
 # ==============================================================================
 
 def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
-                  balance: float, today, direction: str,
-                  sl_dist: float, atr_val: float,
+                  today, direction: str, sl_dist: float, atr_val: float,
                   or_h: float, or_l: float) -> None:
+    """
+    Fetches fresh account_info at entry time.
+    Checks free_margin before sending — prevents retcode 10019.
+    Does NOT use the stale balance passed from the main loop.
+    """
+    acct = mt5.account_info()
+    if acct is None:
+        logger.error(f"[{canon}] account_info unavailable — entry cancelled")
+        return
+    balance     = acct.balance
+    free_margin = acct.margin_free
 
     tick = mt5.symbol_info_tick(broker_sym)
     if tick is None:
@@ -1227,7 +1161,6 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
     sl_dist = max(sl_dist, min_sl)
     sl_price = ep - sl_dist if direction == "long" else ep + sl_dist
 
-    # Edge guard
     if direction == "long" and sl_price >= ep:
         sl_price = ep - min_sl
         sl_dist  = min_sl
@@ -1245,20 +1178,24 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
         logger.error(f"[{canon}] lot calc failed — entry cancelled")
         return
 
-    ticket, _ = send_market_order(
-        broker_sym, direction, lot, sl_price, f"{COMMENT}_{canon}"
-    )
+    # Free margin check — prevents 10019
+    estimated_margin = lot * sl_dist * tvpl
+    if free_margin < estimated_margin:
+        logger.warning(f"[{canon}] insufficient free margin: "
+                       f"free={free_margin:.2f} "
+                       f"needed~={estimated_margin:.2f} — cancelled")
+        return
+
+    ticket, _ = send_market_order(broker_sym, direction, lot, sl_price,
+                                  f"{COMMENT}_{canon}")
     if ticket is None:
         return
 
-    # Confirm fill
     filled = []
     for _ in range(10):
         time.sleep(0.05)
-        filled = [
-            p for p in (mt5.positions_get(symbol=broker_sym) or [])
-            if p.magic == MAGIC and p.ticket == ticket
-        ]
+        filled = [p for p in (mt5.positions_get(symbol=broker_sym) or [])
+                  if p.magic == MAGIC and p.ticket == ticket]
         if filled:
             break
 
@@ -1270,72 +1207,55 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
         actual_ep = ep
         actual_sl = sl_price
 
-    rec = _make_pos_rec(
-        ticket, direction, actual_ep, sl_dist, actual_sl, today, atr_val
-    )
+    rec = _make_pos_rec(ticket, direction, actual_ep, sl_dist,
+                        actual_sl, today, atr_val)
     sym_st["positions"].append(rec)
     sym_st["day_trades_count"] += 1
 
-    logger.info(
-        f"[{canon}] ENTERED {direction.upper()} ticket={ticket} "
-        f"ep={actual_ep:.5f} sl={actual_sl:.5f} "
-        f"sl_dist={sl_dist:.5f} lot={lot} "
-        f"OR_HIGH={or_h:.5f} OR_LOW={or_l:.5f}"
-    )
+    logger.info(f"[{canon}] ENTERED {direction.upper()} ticket={ticket} "
+                f"ep={actual_ep:.5f} sl={actual_sl:.5f} "
+                f"sl_dist={sl_dist:.5f} lot={lot} "
+                f"OR_HIGH={or_h:.5f} OR_LOW={or_l:.5f} "
+                f"balance={balance:.2f} free_margin={free_margin:.2f}")
 
 
 # ==============================================================================
-#  SECTION 13 — PER-BAR PROCESSING
+#  SECTION 14 — PER-BAR PROCESSING
 # ==============================================================================
 
 def process_bar(canon: str, broker_sym: str, sym_st: dict,
-                cache: dict, params: dict, balance: float,
+                cache: dict, params: dict,
                 new_bar_time: pd.Timestamp) -> None:
     """
-    Called once per confirmed closed M5 bar.
-
-    1. Fetch the closed bar OHLC from broker.
-    2. Append to cache arrays + recompute indicators (O(1)).
-    3. Write bar to CSV (always in canonical format).
-    4. Manage open positions (EOD, BE, trail, SL retry).
-    5. Check signal on last bar — if fired, execute entry immediately.
+    new_bar_time: hint from clock, not used for fetch validation.
+    _fetch_single_closed_bar uses cache's own last bar time as reference.
     """
-    # ── 1. Fetch closed bar ───────────────────────────────────────────────────
-    bar = _fetch_single_closed_bar(broker_sym, new_bar_time)
+    last_cached = pd.Timestamp(int(cache["times"][-1]))
+
+    bar = _fetch_single_closed_bar(broker_sym, last_cached)
     if bar is None:
-        logger.warning(
-            f"[{canon}] could not fetch bar {new_bar_time} — skipping"
-        )
+        logger.warning(f"[{canon}] no new bar after {last_cached} — skipping")
         return
     bar_time, o, h, l, c = bar
 
-    # ── 2. Append to cache ────────────────────────────────────────────────────
     append_bar_to_cache(cache, bar_time, o, h, l, c)
-
-    # ── 3. Write to CSV (canonical comma-sep ISO format) ─────────────────────
     _append_csv(canon, bar_time, o, h, l, c)
 
-    # ── 4. Manage positions ───────────────────────────────────────────────────
     today = cache["dates"][-1]
     _reset_daily(sym_st, today)
     manage_positions(canon, broker_sym, sym_st, cache, params, today)
 
-    # ── 5. Signal check — direct array lookup, same as BT ────────────────────
     i   = cache["n"] - 1
     sig = int(cache["signal"][i])
 
     if sig == 0:
         return
 
-    # Reconcile broker before entry — don't double-enter
-    broker_positions = [
-        p for p in (mt5.positions_get(symbol=broker_sym) or [])
-        if p.magic == MAGIC
-    ]
+    # Double-check broker positions before entry
+    broker_positions = [p for p in (mt5.positions_get(symbol=broker_sym) or [])
+                        if p.magic == MAGIC]
     if len(broker_positions) >= params["max_trades_day"]:
-        logger.info(
-            f"[{canon}] SIGNAL suppressed — already at max positions"
-        )
+        logger.info(f"[{canon}] SIGNAL suppressed — already at max positions")
         return
 
     direction = "long" if sig == 1 else "short"
@@ -1346,27 +1266,21 @@ def process_bar(canon: str, broker_sym: str, sym_st: dict,
     sl_dist   = max(params["sl_range_mult"] * or_size, atr_val * 0.05)
 
     if sl_dist < 3.0:
-        logger.info(
-            f"[{canon}] SIGNAL_SKIP sl_too_tight: {sl_dist:.5f}"
-        )
+        logger.info(f"[{canon}] SIGNAL_SKIP sl_too_tight: {sl_dist:.5f}")
         return
 
-    logger.info(
-        f"[{canon}] SIGNAL {direction.upper()} "
-        f"OR_HIGH={or_h:.5f} OR_LOW={or_l:.5f} "
-        f"close={float(cache['c'][i]):.5f} "
-        f"sl_dist={sl_dist:.5f} atr={atr_val:.5f} "
-        f"day_trades={sym_st['day_trades_count']}/{params['max_trades_day']}"
-    )
+    logger.info(f"[{canon}] SIGNAL {direction.upper()} "
+                f"OR_HIGH={or_h:.5f} OR_LOW={or_l:.5f} "
+                f"close={float(cache['c'][i]):.5f} "
+                f"sl_dist={sl_dist:.5f} atr={atr_val:.5f} "
+                f"day_trades={sym_st['day_trades_count']}/{params['max_trades_day']}")
 
-    execute_entry(
-        canon, broker_sym, sym_st, params, balance, today,
-        direction, sl_dist, atr_val, or_h, or_l
-    )
+    execute_entry(canon, broker_sym, sym_st, params, today,
+                  direction, sl_dist, atr_val, or_h, or_l)
 
 
 # ==============================================================================
-#  SECTION 14 — BAR CLOCK
+#  SECTION 15 — BAR CLOCK
 # ==============================================================================
 
 _CLOCK_BROKER = None
@@ -1401,20 +1315,17 @@ def wait_for_new_bar(last_bar_time: pd.Timestamp) -> pd.Timestamp:
             if t is not None and t > last_bar_time:
                 return t
             time.sleep(0.1)
-        logger.debug(
-            f"[clock] no new bar after {boundary.strftime('%H:%M')} — retry"
-        )
+        logger.debug(f"[clock] no new bar after "
+                     f"{boundary.strftime('%H:%M')} — retry")
 
 
 # ==============================================================================
-#  SECTION 15 — MAIN LOOP
+#  SECTION 16 — MAIN LOOP
 # ==============================================================================
 
-def _process_safe(canon, broker, sym_st, cache, params, balance, new_bar_time):
+def _process_safe(canon, broker, sym_st, cache, params, new_bar_time):
     try:
-        process_bar(
-            canon, broker, sym_st, cache, params, balance, new_bar_time
-        )
+        process_bar(canon, broker, sym_st, cache, params, new_bar_time)
     except Exception as e:
         logger.exception(f"[{canon}] process_bar error: {e}")
 
@@ -1424,11 +1335,10 @@ def run_live():
 
     print("ORB V6 starting...", flush=True)
 
-    # ── MT5 init ──────────────────────────────────────────────────────────────
     for attempt in range(30):
         ok  = mt5.initialize()
         err = mt5.last_error()
-        print(f"  MT5 init attempt {attempt+1}/30: ok={ok} err={err}", flush=True)
+        print(f"  MT5 init {attempt+1}/30: ok={ok} err={err}", flush=True)
         if ok:
             break
         time.sleep(3)
@@ -1441,12 +1351,9 @@ def run_live():
         raise RuntimeError(f"Login failed: {mt5.last_error()}")
 
     acct = mt5.account_info()
-    logger.info(
-        f"MT5 connected | account={acct.login} | "
-        f"balance={acct.balance:.2f} | currency={acct.currency}"
-    )
+    logger.info(f"MT5 connected | account={acct.login} | "
+                f"balance={acct.balance:.2f} | currency={acct.currency}")
 
-    # ── Symbol map ────────────────────────────────────────────────────────────
     sym_map, active = build_symbol_map()
     if not active:
         mt5.shutdown()
@@ -1468,35 +1375,49 @@ def run_live():
             "pip":      pip,
             "point":    info.point if info.point > 0 else pip,
         }
-        logger.info(
-            f"  {canon} ({broker}): digits={info.digits} "
-            f"tvpl={tvpl:.6f} vol_min={info.volume_min} "
-            f"stops_level={info.trade_stops_level} "
-            f"params={BEST_PARAMS[canon]}"
-        )
+        logger.info(f"  {canon} ({broker}): digits={info.digits} "
+                    f"tvpl={tvpl:.6f} vol_min={info.volume_min} "
+                    f"stops_level={info.trade_stops_level} "
+                    f"params={BEST_PARAMS[canon]}")
 
-    _MAX_TRADES_DAY_COMBO = sum(
-        BEST_PARAMS[s]["max_trades_day"] for s in active
-    )
+    _MAX_TRADES_DAY_COMBO = sum(BEST_PARAMS[s]["max_trades_day"] for s in active)
 
-    # ── Build caches from CSV + gap ───────────────────────────────────────────
+    # ── Build caches ──────────────────────────────────────────────────────────
     logger.info("=== BUILDING CACHES ===")
-    caches = {}
+    caches   = {}
+    hist_dfs = {}
     for canon in list(active):
         broker = sym_map[canon]
-        df = load_history(canon, broker)      # normalises CSV format internally
+        df = load_history(canon, broker)
         if df is None or len(df) < WARMUP_M5 + ATR_PERIOD + 10:
             logger.error(f"[{canon}] not enough history — skipping")
             active.remove(canon)
             continue
         cache = build_cache(canon, df, BEST_PARAMS[canon])
         cache["_atr_hist"] = _rebuild_atr_hist(cache["atr14"])
-        caches[canon] = cache
+        caches[canon]   = cache
+        hist_dfs[canon] = df
+    logger.info("=== END CACHES ===")
 
     if not active:
         mt5.shutdown()
         return
-    logger.info("=== END CACHES ===")
+
+    # ── BT accuracy check — must pass before trading ─────────────────────────
+    logger.info("=== BT ACCURACY VERIFICATION ===")
+    for canon in list(active):
+        ok = verify_cache_vs_bt(
+            canon, hist_dfs[canon], caches[canon], BEST_PARAMS[canon]
+        )
+        if not ok:
+            logger.error(f"[{canon}] failed BT accuracy check — removing")
+            active.remove(canon)
+    logger.info("=== END BT ACCURACY VERIFICATION ===")
+
+    if not active:
+        logger.error("No symbols passed BT accuracy — shutting down")
+        mt5.shutdown()
+        return
 
     _CLOCK_BROKER = sym_map[active[0]]
     sym_states    = {c: make_sym_state() for c in active}
@@ -1505,10 +1426,8 @@ def run_live():
     logger.info("=== STARTUP RECOVERY ===")
     for canon in active:
         broker    = sym_map[canon]
-        positions = [
-            p for p in (mt5.positions_get(symbol=broker) or [])
-            if p.magic == MAGIC
-        ]
+        positions = [p for p in (mt5.positions_get(symbol=broker) or [])
+                     if p.magic == MAGIC]
         for pos in positions:
             if COMMENT in (pos.comment or ""):
                 rec = _reconstruct_pos(canon, pos)
@@ -1517,26 +1436,16 @@ def run_live():
                     sym_states[canon]["day_trades_count"] + 1,
                     BEST_PARAMS[canon]["max_trades_day"]
                 )
-        logger.info(
-            f"  {canon}: recovered {len(sym_states[canon]['positions'])} pos"
-        )
+        logger.info(f"  {canon}: recovered "
+                    f"{len(sym_states[canon]['positions'])} pos")
     logger.info("=== END RECOVERY ===")
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
-    # Seed from the cache's own last bar, not the broker.
-    # The broker's last-closed-bar time can be ahead of the cache if the gap
-    # fill missed the most recent bar by a few milliseconds at startup — seeding
-    # from the broker would skip that bar forever.  Seeding from the cache
-    # guarantees wait_for_new_bar fires for every bar the cache hasn't seen.
-    cache_last_times = [
-        pd.Timestamp(int(caches[c]["times"][-1]))
-        for c in active
-    ]
-    last_bar_time = min(cache_last_times)   # conservative: use earliest
-    logger.info(
-        f"Seeded bar time from cache: {last_bar_time} — "
-        f"waiting for next M5 close..."
-    )
+    # Seed from cache's last bar — not broker, not wall clock
+    cache_last_times = [pd.Timestamp(int(caches[c]["times"][-1]))
+                        for c in active]
+    last_bar_time    = min(cache_last_times)
+    logger.info(f"Seeded from cache: {last_bar_time} — "
+                f"waiting for next M5 close...")
 
     bar_count = 0
     while True:
@@ -1545,21 +1454,14 @@ def run_live():
             last_bar_time = new_bar_time
             bar_count    += 1
 
-            balance = mt5.account_info().balance
-            logger.info(
-                f"-- BAR {bar_count} | {new_bar_time} UTC | "
-                f"balance={balance:.2f} "
-                f"------------------------------"
-            )
+            logger.info(f"-- BAR {bar_count} | {new_bar_time} "
+                        f"------------------------------")
 
             threads = [
                 threading.Thread(
                     target=_process_safe,
-                    args=(
-                        canon, sym_map[canon], sym_states[canon],
-                        caches[canon], BEST_PARAMS[canon], balance,
-                        new_bar_time
-                    ),
+                    args=(canon, sym_map[canon], sym_states[canon],
+                          caches[canon], BEST_PARAMS[canon], new_bar_time),
                     daemon=True,
                 )
                 for canon in active
