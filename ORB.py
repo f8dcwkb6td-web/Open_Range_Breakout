@@ -1178,13 +1178,36 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
         logger.error(f"[{canon}] lot calc failed — entry cancelled")
         return
 
-    # Free margin check — prevents 10019
-    estimated_margin = lot * sl_dist * tvpl
-    if free_margin < estimated_margin:
-        logger.warning(f"[{canon}] insufficient free margin: "
-                       f"free={free_margin:.2f} "
-                       f"needed~={estimated_margin:.2f} — cancelled")
-        return
+    # ── Margin check — uses broker's own margin calculation ──────────────────
+    # mt5.order_calc_margin() returns the actual margin the broker will
+    # reserve for this exact lot size at current price.  This is the only
+    # correct way — lot * sl_dist * tvpl is dollar risk, not margin.
+    otype = mt5.ORDER_TYPE_BUY if direction == "long" else mt5.ORDER_TYPE_SELL
+    required_margin = mt5.order_calc_margin(otype, broker_sym, lot, ep)
+
+    if required_margin is None:
+        logger.warning(f"[{canon}] order_calc_margin returned None "
+                       f"— proceeding without margin check")
+    else:
+        # Add 10% buffer — protects against spread widening between
+        # calc time and actual fill, and against floating loss on
+        # existing positions reducing free margin mid-fill.
+        required_with_buffer = required_margin * 1.10
+        if free_margin < required_with_buffer:
+            logger.warning(
+                f"[{canon}] insufficient margin: "
+                f"free={free_margin:.2f} "
+                f"required={required_margin:.2f} "
+                f"(+10% buffer={required_with_buffer:.2f}) "
+                f"lot={lot} price={ep:.5f} — entry cancelled"
+            )
+            return
+        logger.info(
+            f"[{canon}] margin OK: "
+            f"free={free_margin:.2f} "
+            f"required={required_margin:.2f} "
+            f"(+10% buffer={required_with_buffer:.2f})"
+        )
 
     ticket, _ = send_market_order(broker_sym, direction, lot, sl_price,
                                   f"{COMMENT}_{canon}")
@@ -1217,8 +1240,6 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
                 f"sl_dist={sl_dist:.5f} lot={lot} "
                 f"OR_HIGH={or_h:.5f} OR_LOW={or_l:.5f} "
                 f"balance={balance:.2f} free_margin={free_margin:.2f}")
-
-
 # ==============================================================================
 #  SECTION 14 — PER-BAR PROCESSING
 # ==============================================================================
