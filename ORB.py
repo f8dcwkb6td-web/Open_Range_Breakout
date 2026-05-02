@@ -6,6 +6,17 @@ CORE PRINCIPLE:
   Direct port of orb_chrono_bt.py.  OR, ATR, signal logic are IDENTICAL
   to build_cache_and_signals() + resolve_trade() in the BT.
 
+PARITY AUDIT vs BT (orb_chrono_bt.py) — changes applied in this version:
+  1. RISK_PER_TRADE: 0.007  (matches BT — was 0.0085 in prior live)
+  2. sl_dist < 3.0 guard REMOVED from process_bar() — BT has no such guard
+  3. UK100 added to SESSION, BEST_PARAMS, SYMBOL_ALIASES, SYMBOLS
+  4. Symbol aliases updated to match BT (CTI names first: DE40C, UK100C, US30C)
+  5. CSV search extended: UK100.cash.csv added; multi-stem search per canon
+  6. Symbols hardcoded to US30 + UK100 + GER40 combo (user requirement)
+  7. All other logic (OR, ATR, signal, SL, trail, BE, lot sizing, margin
+     check, SL retry, bar fetch, cache update) unchanged and verified
+     identical to BT.
+
 HOW IT WORKS:
   STARTUP:
     1. Normalise CSV (MT5 export -> canonical format).
@@ -43,6 +54,8 @@ FIXES vs previous version:
   - balance passed to threads: removed — each entry fetches its own.
   - BT accuracy check on startup: verify_cache_vs_bt() runs over full
     CSV history and logs match % before any trading begins.
+  - sl_dist < 3.0 guard removed — not present in BT, causes parity gap.
+  - RISK_PER_TRADE corrected to 0.007 to match BT.
 
 LOG:    orb_live_v6.log
 MAGIC:  202603264
@@ -88,7 +101,7 @@ COMMENT = "ORB_V6"
 
 # ── Broker / risk constants ───────────────────────────────────────────────────
 STARTING_BALANCE   = 25_000.0
-RISK_PER_TRADE     = 0.0085
+RISK_PER_TRADE     = 0.007          # PARITY: matches BT (was 0.0085)
 MAX_RISK_MULTIPLE  = 2.0
 DAILY_LOSS_CAP_PCT = 0.0475
 DAILY_LOSS_BUDGET  = STARTING_BALANCE * DAILY_LOSS_CAP_PCT
@@ -109,23 +122,42 @@ MIN_BT_ACCURACY = 0.95
 
 OR_BARS = {15: 3, 30: 6, 60: 12}
 
+# PARITY: UK100 added to match BT SESSION dict
 SESSION = {
     "US30":  {"open_h": 13, "open_m": 30, "close_h": 20},
+    "UK100": {"open_h":  8, "open_m":  0, "close_h": 16},
     "GER40": {"open_h":  8, "open_m":  0, "close_h": 17},
 }
 
+# PARITY: UK100 added, matches BT PARAMS_GRID_BEST exactly
 BEST_PARAMS = {
     "US30":  {"or_minutes": 15, "sl_range_mult": 0.5, "trail_atr_mult": 0.5,
+              "min_break_atr": 0.0, "max_trades_day": 1, "cooldown_bars": 3},
+    "UK100": {"or_minutes": 15, "sl_range_mult": 0.5, "trail_atr_mult": 0.5,
               "min_break_atr": 0.0, "max_trades_day": 1, "cooldown_bars": 3},
     "GER40": {"or_minutes": 15, "sl_range_mult": 0.5, "trail_atr_mult": 0.5,
               "min_break_atr": 0.0, "max_trades_day": 2, "cooldown_bars": 3},
 }
 
+# PARITY: aliases updated to match BT SYMBOL_ALIASES (CTI names first)
 SYMBOL_ALIASES = {
-    "US30":  ["US30.cash", "US30",  "DJ30",  "DJIA",  "WS30", "DOW30", "US30Cash"],
-    "GER40": ["GER40.cash","GER40", "DAX40", "DAX",   "GER30","DE40",  "GER40Cash"],
+    "US30":  ["US30C",   "US30.cash", "US30",   "DJ30",   "DJIA",
+              "WS30",    "DOW30",     "US30Cash"],
+    "UK100": ["UK100C",  "UK100.cash","UK100",  "FTSE100","FTSE",
+              "UK100Cash","UKX"],
+    "GER40": ["DE40C",   "GER40.cash","GER40",  "DAX40",  "DAX",
+              "GER30",   "DE40",      "GER40Cash"],
 }
-SYMBOLS = list(SESSION.keys())
+
+# PARITY: hardcoded to US30 + UK100 + GER40 combo (user requirement)
+SYMBOLS = ["US30", "UK100", "GER40"]
+
+# PARITY: CSV stems to search per canon — mirrors BT CSV_STEMS
+CSV_STEMS = {
+    "US30":  ["US30.cash",  "US30C",   "US30",   "DJ30"],
+    "UK100": ["UK100.cash", "UK100C",  "UK100",  "FTSE", "FTSE100"],
+    "GER40": ["GER40.cash", "DE40C",   "GER40",  "DAX40", "DAX"],
+}
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -142,10 +174,17 @@ CSV_DTYPE = {"open": np.float64, "high": np.float64,
 
 
 def _csv_path(canon: str) -> str:
+    """
+    PARITY: Multi-stem search matching BT's CSV_STEMS logic.
+    Searches SCRIPT_DIR then CWD for each stem with .csv extension.
+    """
+    stems = CSV_STEMS.get(canon, [canon])
     for d in (SCRIPT_DIR, os.getcwd()):
-        p = os.path.join(d, f"{canon}.cash.csv")
-        if os.path.isfile(p):
-            return p
+        for stem in stems:
+            p = os.path.join(d, f"{stem}.csv")
+            if os.path.isfile(p):
+                return p
+    # Fallback: return canonical path for writing new CSV
     return os.path.join(SCRIPT_DIR, f"{canon}.cash.csv")
 
 
@@ -205,7 +244,8 @@ def _load_csv(canon: str):
         df.sort_values("time_utc", inplace=True)
         df.drop_duplicates(subset="time_utc", keep="last", inplace=True)
         df.reset_index(drop=True, inplace=True)
-        logger.info(f"[{canon}] CSV: {len(df):,} bars  "
+        logger.info(f"[{canon}] CSV ({os.path.basename(path)}): "
+                    f"{len(df):,} bars  "
                     f"{df['time_utc'].iloc[0].date()} -> "
                     f"{df['time_utc'].iloc[-1].strftime('%Y-%m-%d %H:%M')}")
         return df
@@ -1143,6 +1183,10 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
     Fetches fresh account_info at entry time.
     Checks free_margin before sending — prevents retcode 10019.
     Does NOT use the stale balance passed from the main loop.
+
+    PARITY: sl_dist = max(sl_range_mult * or_size, atr * 0.05)
+    This matches BT resolve_trade() exactly. No additional 3-point
+    floor is applied here (that guard was removed from process_bar).
     """
     acct = mt5.account_info()
     if acct is None:
@@ -1179,9 +1223,6 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
         return
 
     # ── Margin check — uses broker's own margin calculation ──────────────────
-    # mt5.order_calc_margin() returns the actual margin the broker will
-    # reserve for this exact lot size at current price.  This is the only
-    # correct way — lot * sl_dist * tvpl is dollar risk, not margin.
     otype = mt5.ORDER_TYPE_BUY if direction == "long" else mt5.ORDER_TYPE_SELL
     required_margin = mt5.order_calc_margin(otype, broker_sym, lot, ep)
 
@@ -1189,9 +1230,6 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
         logger.warning(f"[{canon}] order_calc_margin returned None "
                        f"— proceeding without margin check")
     else:
-        # Add 10% buffer — protects against spread widening between
-        # calc time and actual fill, and against floating loss on
-        # existing positions reducing free margin mid-fill.
         required_with_buffer = required_margin * 1.10
         if free_margin < required_with_buffer:
             logger.warning(
@@ -1240,6 +1278,8 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
                 f"sl_dist={sl_dist:.5f} lot={lot} "
                 f"OR_HIGH={or_h:.5f} OR_LOW={or_l:.5f} "
                 f"balance={balance:.2f} free_margin={free_margin:.2f}")
+
+
 # ==============================================================================
 #  SECTION 14 — PER-BAR PROCESSING
 # ==============================================================================
@@ -1250,6 +1290,10 @@ def process_bar(canon: str, broker_sym: str, sym_st: dict,
     """
     new_bar_time: hint from clock, not used for fetch validation.
     _fetch_single_closed_bar uses cache's own last bar time as reference.
+
+    PARITY: sl_dist < 3.0 guard REMOVED — not present in BT resolve_trade().
+    sl_dist is computed as max(sl_range_mult * or_size, atr * 0.05) and
+    passed directly to execute_entry, which applies the same max() again.
     """
     last_cached = pd.Timestamp(int(cache["times"][-1]))
 
@@ -1284,11 +1328,11 @@ def process_bar(canon: str, broker_sym: str, sym_st: dict,
     or_l      = float(cache["or_low"][i])
     atr_val   = float(cache["atr14"][i])
     or_size   = or_h - or_l
-    sl_dist   = max(params["sl_range_mult"] * or_size, atr_val * 0.05)
 
-    if sl_dist < 3.0:
-        logger.info(f"[{canon}] SIGNAL_SKIP sl_too_tight: {sl_dist:.5f}")
-        return
+    # PARITY: sl_dist matches BT resolve_trade() exactly:
+    #   sl_dist = max(sl_range_mult * or_size, atr * 0.05)
+    # No 3-point floor — that was a live-only guard with no BT equivalent.
+    sl_dist = max(params["sl_range_mult"] * or_size, atr_val * 0.05)
 
     logger.info(f"[{canon}] SIGNAL {direction.upper()} "
                 f"OR_HIGH={or_h:.5f} OR_LOW={or_l:.5f} "
