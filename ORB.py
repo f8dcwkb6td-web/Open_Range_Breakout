@@ -91,16 +91,16 @@ logger.addHandler(_sh)
 
 # ── MT5 connection ────────────────────────────────────────────────────────────
 TERMINAL_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
-LOGIN         = 1513214612
-PASSWORD      = "h2QE?*1!v5fQ"
-SERVER        = "FTMO-Demo"
+LOGIN         = 2298619
+PASSWORD      = "7245f!Ej6B"
+SERVER        = "CityTradersImperium-Real"
 
 # ── Engine identity ───────────────────────────────────────────────────────────
 MAGIC   = 202603264
 COMMENT = "ORB_V6"
 
 # ── Broker / risk constants ───────────────────────────────────────────────────
-STARTING_BALANCE   = 25_000.0
+STARTING_BALANCE   = 100_000.0
 RISK_PER_TRADE     = 0.007          # PARITY: matches BT (was 0.0085)
 MAX_RISK_MULTIPLE  = 2.0
 DAILY_LOSS_CAP_PCT = 0.0475
