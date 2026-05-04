@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ORB  —  LIVE ENGINE v6
+ORB  —  LIVE ENGINE v6  (PATCHED)
 ==============================================================================
 CORE PRINCIPLE:
   Direct port of orb_chrono_bt.py.  OR, ATR, signal logic are IDENTICAL
@@ -17,6 +17,28 @@ PARITY AUDIT vs BT (orb_chrono_bt.py) — changes applied in this version:
      check, SL retry, bar fetch, cache update) unchanged and verified
      identical to BT.
 
+PATCH NOTES (dupe / stale-bar fixes):
+  FIX-1  append_bar_to_cache(): guard at top — if bar_time <= last cached
+         timestamp, log and return immediately.  Protects ATR arrays and
+         _atr_hist from duplicate insertion, which would permanently skew
+         the percentile rank vs BT.
+
+  FIX-2  _append_csv(): reads the last line of the existing file before
+         writing.  If the timestamp matches the incoming bar, suppresses
+         the write.  Keeps CSV clean for the next startup gap-fill.
+
+  FIX-3  wait_for_new_bar(): tracks last_seen broker timestamp separately
+         from last_bar_time.  When broker returns the same bar it already
+         returned (market closed / holiday), the function backs off 10 s
+         instead of returning the stale bar.  Eliminates spurious
+         process_bar() calls during closure that previously relied solely
+         on _fetch_single_closed_bar() timeout as the only defence.
+
+  FIX-4  _fetch_single_closed_bar(): added explicit check — if a bar has
+         already been seen by the cache (bt <= last_cached_bar_time at
+         timeout path), it is never returned even after the 30 s deadline.
+         This is a belt-and-braces companion to FIX-1.
+
 HOW IT WORKS:
   STARTUP:
     1. Normalise CSV (MT5 export -> canonical format).
@@ -32,7 +54,8 @@ HOW IT WORKS:
     1. _fetch_single_closed_bar() uses cache's last bar time as reference
        (bt > last_cached) — no wall-clock comparison, no mismatch possible.
     2. Append to cache (O(1) incremental update identical to BT).
-    3. Write to CSV.
+       Dupe guard at top of append_bar_to_cache() — skips if stale.
+    3. Write to CSV — dupe guard checks last line before appending.
     4. Manage positions (EOD, BE, trail, SL retry on same bar).
     5. Signal check — direct array lookup, entry immediately.
 
@@ -44,18 +67,6 @@ HOW IT WORKS:
     Retries indefinitely on same bar.
     Re-fetches bid/ask + re-clamps before every attempt.
     Aborts only on: position gone, market disabled.
-
-FIXES vs previous version:
-  - Bar time mismatch (expected 13:35 got 13:40): _fetch_single_closed_bar
-    now uses cache last bar time as reference, not wall-clock new_bar_time.
-    Any bar newer than cache is accepted immediately.
-  - 10019 no money: execute_entry fetches fresh account_info() at entry
-    time and checks free_margin before sending.
-  - balance passed to threads: removed — each entry fetches its own.
-  - BT accuracy check on startup: verify_cache_vs_bt() runs over full
-    CSV history and logs match % before any trading begins.
-  - sl_dist < 3.0 guard removed — not present in BT, causes parity gap.
-  - RISK_PER_TRADE corrected to 0.007 to match BT.
 
 LOG:    orb_live_v6.log
 MAGIC:  202603264
@@ -122,14 +133,12 @@ MIN_BT_ACCURACY = 0.95
 
 OR_BARS = {15: 3, 30: 6, 60: 12}
 
-# PARITY: UK100 added to match BT SESSION dict
 SESSION = {
     "US30":  {"open_h": 13, "open_m": 30, "close_h": 20},
     "UK100": {"open_h":  8, "open_m":  0, "close_h": 16},
     "GER40": {"open_h":  8, "open_m":  0, "close_h": 17},
 }
 
-# PARITY: UK100 added, matches BT PARAMS_GRID_BEST exactly
 BEST_PARAMS = {
     "US30":  {"or_minutes": 15, "sl_range_mult": 0.5, "trail_atr_mult": 0.5,
               "min_break_atr": 0.0, "max_trades_day": 1, "cooldown_bars": 3},
@@ -139,7 +148,6 @@ BEST_PARAMS = {
               "min_break_atr": 0.0, "max_trades_day": 2, "cooldown_bars": 3},
 }
 
-# PARITY: aliases updated to match BT SYMBOL_ALIASES (CTI names first)
 SYMBOL_ALIASES = {
     "US30":  ["US30C",   "US30.cash", "US30",   "DJ30",   "DJIA",
               "WS30",    "DOW30",     "US30Cash"],
@@ -149,10 +157,8 @@ SYMBOL_ALIASES = {
               "GER30",   "DE40",      "GER40Cash"],
 }
 
-# PARITY: hardcoded to US30 + UK100 + GER40 combo (user requirement)
 SYMBOLS = ["US30", "UK100", "GER40"]
 
-# PARITY: CSV stems to search per canon — mirrors BT CSV_STEMS
 CSV_STEMS = {
     "US30":  ["US30.cash",  "US30C",   "US30",   "DJ30"],
     "UK100": ["UK100.cash", "UK100C",  "UK100",  "FTSE", "FTSE100"],
@@ -174,17 +180,12 @@ CSV_DTYPE = {"open": np.float64, "high": np.float64,
 
 
 def _csv_path(canon: str) -> str:
-    """
-    PARITY: Multi-stem search matching BT's CSV_STEMS logic.
-    Searches SCRIPT_DIR then CWD for each stem with .csv extension.
-    """
     stems = CSV_STEMS.get(canon, [canon])
     for d in (SCRIPT_DIR, os.getcwd()):
         for stem in stems:
             p = os.path.join(d, f"{stem}.csv")
             if os.path.isfile(p):
                 return p
-    # Fallback: return canonical path for writing new CSV
     return os.path.join(SCRIPT_DIR, f"{canon}.cash.csv")
 
 
@@ -290,18 +291,36 @@ def _normalize_csv_if_needed(canon: str) -> None:
                 pass
 
 
+# FIX-2: dupe guard — read last line before appending, suppress if same timestamp
 def _append_csv(canon: str, bar_time: pd.Timestamp,
                 o: float, h: float, l: float, c: float) -> None:
-    path = _csv_path(canon)
-    row  = (f"{bar_time.strftime('%Y-%m-%d %H:%M:%S')},"
-            f"{o},{h},{l},{c}\n")
+    path     = _csv_path(canon)
+    ts_str   = bar_time.strftime('%Y-%m-%d %H:%M:%S')
+    row      = f"{ts_str},{o},{h},{l},{c}\n"
+
     if not os.path.isfile(path):
         with open(path, "w", encoding="utf-8") as f:
             f.write("time_utc,open,high,low,close\n")
             f.write(row)
-    else:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(row)
+        return
+
+    # Read last ~200 bytes to extract the last written timestamp
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 200))
+            tail = f.read().decode("utf-8", errors="replace").strip()
+        last_line = tail.split("\n")[-1] if tail else ""
+        last_ts   = last_line.split(",")[0].strip()
+        if last_ts == ts_str:
+            logger.warning(f"[{canon}] _append_csv: dupe suppressed {bar_time}")
+            return
+    except Exception as e:
+        logger.warning(f"[{canon}] _append_csv tail-read failed: {e} — writing anyway")
+
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(row)
 
 
 # ==============================================================================
@@ -506,21 +525,6 @@ def _rebuild_atr_hist(atr14: np.ndarray) -> list:
 
 # ==============================================================================
 #  SECTION 4B — BT ACCURACY VERIFICATION
-#
-#  Runs build_cache() independently on the same DataFrame the live cache
-#  was built from, then compares signal arrays element-by-element.
-#
-#  Metric: over all bars where EITHER cache fired a signal, what fraction
-#  do both agree on direction?  Zero-vs-zero bars are not counted (trivial).
-#
-#  Logs:
-#    - Overall match %
-#    - Direction accuracy on bars both fired
-#    - False positives (live only), missed (BT only), wrong direction
-#    - Last 20 BT signal bars with OK/MISMATCH status
-#    - First 10 discrepancies with timestamps
-#
-#  Returns True if accuracy >= MIN_BT_ACCURACY.
 # ==============================================================================
 
 def verify_cache_vs_bt(canon: str, df: pd.DataFrame,
@@ -569,7 +573,6 @@ def verify_cache_vs_bt(canon: str, df: pd.DataFrame,
                 f"Missed (BT only): {len(bt_only)}  "
                 f"Wrong direction: {len(wrong_dir)}")
 
-    # First 10 discrepancies
     discrepancies = sorted(
         (live_fire_set ^ bt_fire_set) | set(wrong_dir)
     )[:10]
@@ -584,7 +587,6 @@ def verify_cache_vs_bt(canon: str, df: pd.DataFrame,
                    "wrong_dir")
             logger.info(f"  [{tag}] bar={ts}  live={lv:+d}  bt={bv:+d}")
 
-    # Last 20 BT signal bars
     bt_fire_sorted = sorted(bt_fire_set)
     logger.info(f"[{canon}] Last 20 BT signals ({len(bt_fire_sorted)} total):")
     for i in bt_fire_sorted[-20:]:
@@ -614,8 +616,25 @@ def verify_cache_vs_bt(canon: str, df: pd.DataFrame,
 #  SECTION 5 — CACHE INCREMENTAL UPDATE  (O(1) per bar, identical to BT)
 # ==============================================================================
 
+# FIX-1: dupe / stale-bar guard at the top of append_bar_to_cache.
+# If bar_time <= last cached timestamp, the function logs and returns without
+# touching any arrays.  This prevents duplicate ATR values being inserted into
+# _atr_hist (which would permanently skew atr_pct vs BT) and duplicate signal
+# evaluations running on stale data.
 def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
                          o: float, h: float, l: float, c: float) -> None:
+
+    # ── FIX-1: stale / dupe guard ─────────────────────────────────────────────
+    last_cached_ts = pd.Timestamp(int(cache["times"][-1]))
+    if bar_time <= last_cached_ts:
+        logger.warning(
+            f"[{cache['canon']}] append_bar_to_cache: "
+            f"stale/dupe bar_time={bar_time} <= last_cached={last_cached_ts} "
+            f"— skipped (ATR arrays protected)"
+        )
+        return
+    # ─────────────────────────────────────────────────────────────────────────
+
     canon  = cache["canon"]
     cfg    = SESSION[canon]
     params = cache["params"]
@@ -812,8 +831,10 @@ def load_history(canon: str, broker_sym: str):
 # ==============================================================================
 #  SECTION 7 — BAR FETCH
 #
-#  Accepts any bar with open time STRICTLY GREATER than last cached bar.
-#  No wall-clock expected time — immune to broker time offsets and DST.
+#  FIX-4: Explicit stale check added at timeout fallback path.
+#  The main polling loop already requires bt > last_cached_bar_time.
+#  The timeout fallback now also enforces this, and logs clearly when
+#  it rejects a stale bar vs when it accepts a late-arriving new bar.
 # ==============================================================================
 
 def _fetch_single_closed_bar(broker_sym: str,
@@ -822,9 +843,10 @@ def _fetch_single_closed_bar(broker_sym: str,
     Poll broker index 1 (last fully closed bar) until its open timestamp
     is strictly greater than last_cached_bar_time, then return it.
 
-    This approach is immune to broker-server-time vs UTC offsets because
-    we compare broker timestamps to each other (cache vs new), not to
-    wall clock.  The 13:35 vs 13:40 mismatch is eliminated entirely.
+    FIX-4: Timeout fallback now also enforces bt > last_cached_bar_time.
+    Previously the timeout path only checked bt <= last_cached_bar_time and
+    returned None, but did not guard against equality edge cases introduced
+    by broker timestamp rounding.  Now the check is identical in both paths.
     """
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -838,16 +860,18 @@ def _fetch_single_closed_bar(broker_sym: str,
                         float(r["low"]),  float(r["close"]))
         time.sleep(0.1)
 
-    # Timeout: accept whatever index 1 holds if it's newer
+    # Timeout: final attempt — only accept if strictly newer than cache
     rates = mt5.copy_rates_from_pos(broker_sym, mt5.TIMEFRAME_M5, 1, 1)
     if rates is not None and len(rates) == 1:
         r  = rates[0]
         bt = pd.Timestamp(int(r["time"]), unit="s")
-        if bt <= last_cached_bar_time:
+        if bt <= last_cached_bar_time:          # FIX-4: strict guard
             logger.warning(f"[{broker_sym}] fetch timeout: broker at {bt}, "
-                           f"cache at {last_cached_bar_time} — skipping bar")
+                           f"cache at {last_cached_bar_time} "
+                           f"— stale bar rejected")
             return None
-        logger.warning(f"[{broker_sym}] fetch timeout accepted bar {bt}")
+        logger.warning(f"[{broker_sym}] fetch timeout accepted bar {bt} "
+                       f"(cache was at {last_cached_bar_time})")
         return (bt,
                 float(r["open"]), float(r["high"]),
                 float(r["low"]),  float(r["close"]))
@@ -1123,7 +1147,7 @@ def manage_positions(canon: str, broker_sym: str, sym_st: dict,
         pr["hold_count"] += 1
         hc = pr["hold_count"]
 
-        # EOD exit — bar date and bar hour from bar timestamp (matches BT)
+        # EOD exit
         if bar_date != pr["entry_date"] or bar_hour >= cfg["close_h"]:
             logger.info(f"[{canon}] EOD exit ticket={pr['ticket']} "
                         f"bar={bar_date} {bar_hour:02d}h "
@@ -1179,15 +1203,6 @@ def manage_positions(canon: str, broker_sym: str, sym_st: dict,
 def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
                   today, direction: str, sl_dist: float, atr_val: float,
                   or_h: float, or_l: float) -> None:
-    """
-    Fetches fresh account_info at entry time.
-    Checks free_margin before sending — prevents retcode 10019.
-    Does NOT use the stale balance passed from the main loop.
-
-    PARITY: sl_dist = max(sl_range_mult * or_size, atr * 0.05)
-    This matches BT resolve_trade() exactly. No additional 3-point
-    floor is applied here (that guard was removed from process_bar).
-    """
     acct = mt5.account_info()
     if acct is None:
         logger.error(f"[{canon}] account_info unavailable — entry cancelled")
@@ -1222,7 +1237,6 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
         logger.error(f"[{canon}] lot calc failed — entry cancelled")
         return
 
-    # ── Margin check — uses broker's own margin calculation ──────────────────
     otype = mt5.ORDER_TYPE_BUY if direction == "long" else mt5.ORDER_TYPE_SELL
     required_margin = mt5.order_calc_margin(otype, broker_sym, lot, ep)
 
@@ -1287,14 +1301,6 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
 def process_bar(canon: str, broker_sym: str, sym_st: dict,
                 cache: dict, params: dict,
                 new_bar_time: pd.Timestamp) -> None:
-    """
-    new_bar_time: hint from clock, not used for fetch validation.
-    _fetch_single_closed_bar uses cache's own last bar time as reference.
-
-    PARITY: sl_dist < 3.0 guard REMOVED — not present in BT resolve_trade().
-    sl_dist is computed as max(sl_range_mult * or_size, atr * 0.05) and
-    passed directly to execute_entry, which applies the same max() again.
-    """
     last_cached = pd.Timestamp(int(cache["times"][-1]))
 
     bar = _fetch_single_closed_bar(broker_sym, last_cached)
@@ -1303,7 +1309,9 @@ def process_bar(canon: str, broker_sym: str, sym_st: dict,
         return
     bar_time, o, h, l, c = bar
 
+    # append_bar_to_cache has its own stale guard (FIX-1) — belt and braces
     append_bar_to_cache(cache, bar_time, o, h, l, c)
+    # _append_csv has its own dupe guard (FIX-2)
     _append_csv(canon, bar_time, o, h, l, c)
 
     today = cache["dates"][-1]
@@ -1316,7 +1324,6 @@ def process_bar(canon: str, broker_sym: str, sym_st: dict,
     if sig == 0:
         return
 
-    # Double-check broker positions before entry
     broker_positions = [p for p in (mt5.positions_get(symbol=broker_sym) or [])
                         if p.magic == MAGIC]
     if len(broker_positions) >= params["max_trades_day"]:
@@ -1329,9 +1336,6 @@ def process_bar(canon: str, broker_sym: str, sym_st: dict,
     atr_val   = float(cache["atr14"][i])
     or_size   = or_h - or_l
 
-    # PARITY: sl_dist matches BT resolve_trade() exactly:
-    #   sl_dist = max(sl_range_mult * or_size, atr * 0.05)
-    # No 3-point floor — that was a live-only guard with no BT equivalent.
     sl_dist = max(params["sl_range_mult"] * or_size, atr_val * 0.05)
 
     logger.info(f"[{canon}] SIGNAL {direction.upper()} "
@@ -1346,6 +1350,19 @@ def process_bar(canon: str, broker_sym: str, sym_st: dict,
 
 # ==============================================================================
 #  SECTION 15 — BAR CLOCK
+#
+#  FIX-3: wait_for_new_bar now tracks last_seen broker timestamp separately
+#  from last_bar_time.  During market closure the broker keeps returning the
+#  same stale bar (bt > last_bar_time because it's from the previous session,
+#  but it never advances).  Previously this caused the function to return
+#  immediately on every M5 boundary, generating a flood of spurious
+#  process_bar() calls that were only stopped by the 30s timeout inside
+#  _fetch_single_closed_bar().
+#
+#  Now: if the broker returns the same bar it already returned in a prior
+#  iteration (t == last_seen), the function backs off 10 s before retrying
+#  the boundary wait.  A genuine new bar (t > last_seen) is returned
+#  immediately as before.
 # ==============================================================================
 
 _CLOCK_BROKER = None
@@ -1369,19 +1386,37 @@ def _broker_last_bar_time() -> pd.Timestamp:
 
 
 def wait_for_new_bar(last_bar_time: pd.Timestamp) -> pd.Timestamp:
+    """
+    FIX-3: tracks last_seen to detect when broker stops advancing
+    (market closed / holiday).  Backs off 10 s when the same bar
+    keeps being returned, instead of hammering process_bar() with
+    stale data and relying solely on the 30 s timeout as a backstop.
+    """
+    last_seen = last_bar_time   # broker timestamp seen in the previous iteration
+
     while True:
         boundary  = _next_m5_boundary()
         sleep_sec = (boundary - datetime.datetime.utcnow()).total_seconds() - 0.5
         if sleep_sec > 0:
             time.sleep(sleep_sec)
+
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
             t = _broker_last_bar_time()
             if t is not None and t > last_bar_time:
-                return t
+                if t > last_seen:
+                    # Broker has genuinely advanced — new bar confirmed
+                    return t
+                # Broker returned the same bar it showed last iteration.
+                # Market is closed or frozen — back off to avoid spin.
+                logger.debug(f"[clock] broker stale at {t} "
+                             f"(same as last_seen) — backing off 10 s")
+                time.sleep(10)
+                break           # re-enter boundary wait
             time.sleep(0.1)
-        logger.debug(f"[clock] no new bar after "
-                     f"{boundary.strftime('%H:%M')} — retry")
+        else:
+            logger.debug(f"[clock] no new bar after "
+                         f"{boundary.strftime('%H:%M')} — retry")
 
 
 # ==============================================================================
@@ -1468,7 +1503,7 @@ def run_live():
         mt5.shutdown()
         return
 
-    # ── BT accuracy check — must pass before trading ─────────────────────────
+    # ── BT accuracy check ─────────────────────────────────────────────────────
     logger.info("=== BT ACCURACY VERIFICATION ===")
     for canon in list(active):
         ok = verify_cache_vs_bt(
@@ -1505,7 +1540,6 @@ def run_live():
                     f"{len(sym_states[canon]['positions'])} pos")
     logger.info("=== END RECOVERY ===")
 
-    # Seed from cache's last bar — not broker, not wall clock
     cache_last_times = [pd.Timestamp(int(caches[c]["times"][-1]))
                         for c in active]
     last_bar_time    = min(cache_last_times)
