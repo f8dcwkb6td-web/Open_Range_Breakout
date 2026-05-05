@@ -1,75 +1,27 @@
 """
 ==============================================================================
-ORB  —  LIVE ENGINE v6  (PATCHED)
+ORB  —  LIVE ENGINE v6  (PATCHED + WATCHDOG)
 ==============================================================================
-CORE PRINCIPLE:
-  Direct port of orb_chrono_bt.py.  OR, ATR, signal logic are IDENTICAL
-  to build_cache_and_signals() + resolve_trade() in the BT.
+WATCHDOG PATCH NOTES:
+  WD-1  _watchdog_thread(): daemon thread that checks _last_heartbeat every
+        60 s.  If no heartbeat for WATCHDOG_TIMEOUT_MIN minutes, logs the
+        frozen call site (last _activity_label) then calls os.execv() to
+        hard-restart the entire Python process in-place.  No external
+        process monitor required.
 
-PARITY AUDIT vs BT (orb_chrono_bt.py) — changes applied in this version:
-  1. RISK_PER_TRADE: 0.007  (matches BT — was 0.0085 in prior live)
-  2. sl_dist < 3.0 guard REMOVED from process_bar() — BT has no such guard
-  3. UK100 added to SESSION, BEST_PARAMS, SYMBOL_ALIASES, SYMBOLS
-  4. Symbol aliases updated to match BT (CTI names first: DE40C, UK100C, US30C)
-  5. CSV search extended: UK100.cash.csv added; multi-stem search per canon
-  6. Symbols hardcoded to US30 + UK100 + GER40 combo (user requirement)
-  7. All other logic (OR, ATR, signal, SL, trail, BE, lot sizing, margin
-     check, SL retry, bar fetch, cache update) unchanged and verified
-     identical to BT.
+  WD-2  _ping(): one-liner called before every MT5 API call.  Updates
+        _last_heartbeat and sets _activity_label so the watchdog log shows
+        exactly which call was frozen at restart time.
 
-PATCH NOTES (dupe / stale-bar fixes):
-  FIX-1  append_bar_to_cache(): guard at top — if bar_time <= last cached
-         timestamp, log and return immediately.  Protects ATR arrays and
-         _atr_hist from duplicate insertion, which would permanently skew
-         the percentile rank vs BT.
+  WD-3  wait_for_new_bar() upgraded:
+        - Heartbeat log at the top of every cycle (INFO, always visible).
+        - 'else' clause on inner poll loop changed from DEBUG to INFO.
+        - last_seen updated before break (fixes prior Bug 1).
 
-  FIX-2  _append_csv(): reads the last line of the existing file before
-         writing.  If the timestamp matches the incoming bar, suppresses
-         the write.  Keeps CSV clean for the next startup gap-fill.
+  WD-4  _broker_last_bar_time() now logs WARNING when MT5 returns None
+        (disconnected / terminal frozen) instead of silently returning None.
 
-  FIX-3  wait_for_new_bar(): tracks last_seen broker timestamp separately
-         from last_bar_time.  When broker returns the same bar it already
-         returned (market closed / holiday), the function backs off 10 s
-         instead of returning the stale bar.  Eliminates spurious
-         process_bar() calls during closure that previously relied solely
-         on _fetch_single_closed_bar() timeout as the only defence.
-
-  FIX-4  _fetch_single_closed_bar(): added explicit check — if a bar has
-         already been seen by the cache (bt <= last_cached_bar_time at
-         timeout path), it is never returned even after the 30 s deadline.
-         This is a belt-and-braces companion to FIX-1.
-
-HOW IT WORKS:
-  STARTUP:
-    1. Normalise CSV (MT5 export -> canonical format).
-    2. Load CSV history.
-    3. Gap-fill from broker.
-    4. Run build_cache() — same as BT build_cache_and_signals().
-    5. Run verify_cache_vs_bt() — compares live cache signals against
-       BT re-run on the same data.  Logs % accuracy per symbol.
-       ABORTS that symbol if accuracy < MIN_BT_ACCURACY (95%).
-    6. Enter bar loop.
-
-  EACH NEW BAR:
-    1. _fetch_single_closed_bar() uses cache's last bar time as reference
-       (bt > last_cached) — no wall-clock comparison, no mismatch possible.
-    2. Append to cache (O(1) incremental update identical to BT).
-       Dupe guard at top of append_bar_to_cache() — skips if stale.
-    3. Write to CSV — dupe guard checks last line before appending.
-    4. Manage positions (EOD, BE, trail, SL retry on same bar).
-    5. Signal check — direct array lookup, entry immediately.
-
-  ENTRY:
-    Fresh account_info() at entry time — not stale balance from main loop.
-    Free margin check before sending order — prevents 10019.
-
-  SL MODIFICATION:
-    Retries indefinitely on same bar.
-    Re-fetches bid/ask + re-clamps before every attempt.
-    Aborts only on: position gone, market disabled.
-
-LOG:    orb_live_v6.log
-MAGIC:  202603264
+  All original logic, constants, and parity with BT unchanged.
 ==============================================================================
 """
 
@@ -112,7 +64,7 @@ COMMENT = "ORB_V6"
 
 # ── Broker / risk constants ───────────────────────────────────────────────────
 STARTING_BALANCE   = 100_000.0
-RISK_PER_TRADE     = 0.007          # PARITY: matches BT (was 0.0085)
+RISK_PER_TRADE     = 0.007
 MAX_RISK_MULTIPLE  = 2.0
 DAILY_LOSS_CAP_PCT = 0.0475
 DAILY_LOSS_BUDGET  = STARTING_BALANCE * DAILY_LOSS_CAP_PCT
@@ -128,7 +80,6 @@ ATR_PCT_THRESH = 0.30
 MAX_HOLD       = 48
 M5_SECONDS     = 300
 
-# Minimum signal match rate vs BT required before going live per symbol.
 MIN_BT_ACCURACY = 0.95
 
 OR_BARS = {15: 3, 30: 6, 60: 12}
@@ -169,6 +120,61 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _tick_info:            dict = {}
 _MAX_TRADES_DAY_COMBO: int  = 0
+
+# ==============================================================================
+#  WATCHDOG  (WD-1, WD-2)
+# ==============================================================================
+
+WATCHDOG_TIMEOUT_MIN = 10   # restart if no heartbeat for this many minutes
+
+_last_heartbeat  = time.monotonic()
+_activity_label  = "startup"
+_heartbeat_lock  = threading.Lock()
+
+
+def _ping(label: str) -> None:
+    """WD-2: call before every MT5 API call or blocking operation."""
+    global _last_heartbeat, _activity_label
+    with _heartbeat_lock:
+        _last_heartbeat = time.monotonic()
+        _activity_label = label
+
+
+def _watchdog_thread() -> None:
+    """
+    WD-1: checks heartbeat every 60 s.
+    If stale for WATCHDOG_TIMEOUT_MIN minutes, logs the frozen call site
+    and does os.execv() to restart the process in-place.
+    """
+    time.sleep(60)   # give startup time to complete
+    while True:
+        time.sleep(60)
+        with _heartbeat_lock:
+            since  = time.monotonic() - _last_heartbeat
+            label  = _activity_label
+        since_min = since / 60.0
+        logger.info(f"[watchdog] alive — last activity {since_min:.1f} min ago "
+                    f"(at: {label})")
+        if since_min >= WATCHDOG_TIMEOUT_MIN:
+            logger.error(
+                f"[watchdog] NO HEARTBEAT FOR {since_min:.1f} MIN "
+                f"— last known call: '{label}' "
+                f"— RESTARTING NOW"
+            )
+            # Flush log handlers before exec
+            for h in logger.handlers:
+                try:
+                    h.flush()
+                except Exception:
+                    pass
+            # Hard restart: replace this process with a fresh copy of itself
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def _start_watchdog() -> None:
+    t = threading.Thread(target=_watchdog_thread, daemon=True, name="watchdog")
+    t.start()
+    logger.info(f"[watchdog] started — timeout={WATCHDOG_TIMEOUT_MIN} min")
 
 
 # ==============================================================================
@@ -291,7 +297,6 @@ def _normalize_csv_if_needed(canon: str) -> None:
                 pass
 
 
-# FIX-2: dupe guard — read last line before appending, suppress if same timestamp
 def _append_csv(canon: str, bar_time: pd.Timestamp,
                 o: float, h: float, l: float, c: float) -> None:
     path     = _csv_path(canon)
@@ -304,7 +309,6 @@ def _append_csv(canon: str, bar_time: pd.Timestamp,
             f.write(row)
         return
 
-    # Read last ~200 bytes to extract the last written timestamp
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
@@ -328,6 +332,7 @@ def _append_csv(canon: str, bar_time: pd.Timestamp,
 # ==============================================================================
 
 def resolve_symbol(canonical: str):
+    _ping(f"resolve_symbol:{canonical}")
     all_broker = {s.name.upper(): s.name for s in (mt5.symbols_get() or [])}
     for alias in SYMBOL_ALIASES[canonical]:
         info = mt5.symbol_info(alias)
@@ -360,7 +365,7 @@ def build_symbol_map():
 
 
 # ==============================================================================
-#  SECTION 3 — INDICATORS  (identical to BT)
+#  SECTION 3 — INDICATORS
 # ==============================================================================
 
 def _atr_wilder_full(h, l, c):
@@ -395,7 +400,7 @@ def _expanding_pct_rank(arr):
 
 
 # ==============================================================================
-#  SECTION 4 — BUILD CACHE  (identical to BT build_cache_and_signals)
+#  SECTION 4 — BUILD CACHE
 # ==============================================================================
 
 def build_cache(canon: str, df: pd.DataFrame, params: dict) -> dict:
@@ -544,8 +549,7 @@ def verify_cache_vs_bt(canon: str, df: pd.DataFrame,
     total         = len(all_bars)
 
     if total == 0:
-        logger.warning(f"[{canon}] BT check: no signals in either cache "
-                       f"— nothing to compare (warmup only?)")
+        logger.warning(f"[{canon}] BT check: no signals in either cache")
         return True
 
     matches = sum(
@@ -556,8 +560,7 @@ def verify_cache_vs_bt(canon: str, df: pd.DataFrame,
     accuracy = matches / total
 
     both_fired  = live_fire_set & bt_fire_set
-    dir_matches = sum(1 for i in both_fired
-                      if live_sig[i] == bt_sig[i])
+    dir_matches = sum(1 for i in both_fired if live_sig[i] == bt_sig[i])
     dir_total   = len(both_fired)
     dir_acc     = dir_matches / dir_total if dir_total > 0 else 1.0
 
@@ -565,17 +568,11 @@ def verify_cache_vs_bt(canon: str, df: pd.DataFrame,
     bt_only   = sorted(bt_fire_set   - live_fire_set)
     wrong_dir = sorted(i for i in both_fired if live_sig[i] != bt_sig[i])
 
-    logger.info(f"[{canon}] Signal match: {accuracy:.2%}  "
-                f"({matches}/{total} bars agree)")
-    logger.info(f"[{canon}] Direction match (both fired): {dir_acc:.2%}  "
-                f"({dir_matches}/{dir_total})")
-    logger.info(f"[{canon}] False positives (live only): {len(live_only)}  "
-                f"Missed (BT only): {len(bt_only)}  "
-                f"Wrong direction: {len(wrong_dir)}")
+    logger.info(f"[{canon}] Signal match: {accuracy:.2%} ({matches}/{total})")
+    logger.info(f"[{canon}] Direction match: {dir_acc:.2%} ({dir_matches}/{dir_total})")
+    logger.info(f"[{canon}] FP={len(live_only)} Missed={len(bt_only)} WrongDir={len(wrong_dir)}")
 
-    discrepancies = sorted(
-        (live_fire_set ^ bt_fire_set) | set(wrong_dir)
-    )[:10]
+    discrepancies = sorted((live_fire_set ^ bt_fire_set) | set(wrong_dir))[:10]
     if discrepancies:
         logger.info(f"[{canon}] First discrepancies:")
         for i in discrepancies:
@@ -587,53 +584,30 @@ def verify_cache_vs_bt(canon: str, df: pd.DataFrame,
                    "wrong_dir")
             logger.info(f"  [{tag}] bar={ts}  live={lv:+d}  bt={bv:+d}")
 
-    bt_fire_sorted = sorted(bt_fire_set)
-    logger.info(f"[{canon}] Last 20 BT signals ({len(bt_fire_sorted)} total):")
-    for i in bt_fire_sorted[-20:]:
-        ts    = pd.Timestamp(int(times[i])) if i < len(times) else "?"
-        lv    = int(live_sig[i]) if i < len(live_sig) else 0
-        bv    = int(bt_sig[i])
-        ok    = "OK" if lv == bv else "MISMATCH"
-        orh   = float(bt_cache["or_high"][i])
-        orl   = float(bt_cache["or_low"][i])
-        cl    = float(bt_cache["c"][i])
-        logger.info(f"  [{ok}] {ts}  BT={bv:+d} live={lv:+d}  "
-                    f"OR_H={orh:.5f} OR_L={orl:.5f} close={cl:.5f}")
-
     logger.info(f"[{canon}] === END BT ACCURACY CHECK ===")
 
     if accuracy < MIN_BT_ACCURACY:
-        logger.error(f"[{canon}] accuracy {accuracy:.2%} < "
-                     f"required {MIN_BT_ACCURACY:.2%} — ABORTING this symbol")
+        logger.error(f"[{canon}] accuracy {accuracy:.2%} < {MIN_BT_ACCURACY:.2%} — ABORTING")
         return False
 
-    logger.info(f"[{canon}] accuracy {accuracy:.2%} >= "
-                f"{MIN_BT_ACCURACY:.2%} — OK to trade")
+    logger.info(f"[{canon}] accuracy {accuracy:.2%} >= {MIN_BT_ACCURACY:.2%} — OK")
     return True
 
 
 # ==============================================================================
-#  SECTION 5 — CACHE INCREMENTAL UPDATE  (O(1) per bar, identical to BT)
+#  SECTION 5 — CACHE INCREMENTAL UPDATE
 # ==============================================================================
 
-# FIX-1: dupe / stale-bar guard at the top of append_bar_to_cache.
-# If bar_time <= last cached timestamp, the function logs and returns without
-# touching any arrays.  This prevents duplicate ATR values being inserted into
-# _atr_hist (which would permanently skew atr_pct vs BT) and duplicate signal
-# evaluations running on stale data.
 def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
                          o: float, h: float, l: float, c: float) -> None:
 
-    # ── FIX-1: stale / dupe guard ─────────────────────────────────────────────
     last_cached_ts = pd.Timestamp(int(cache["times"][-1]))
     if bar_time <= last_cached_ts:
         logger.warning(
-            f"[{cache['canon']}] append_bar_to_cache: "
-            f"stale/dupe bar_time={bar_time} <= last_cached={last_cached_ts} "
-            f"— skipped (ATR arrays protected)"
+            f"[{cache['canon']}] append_bar_to_cache: stale bar {bar_time} "
+            f"<= {last_cached_ts} — skipped"
         )
         return
-    # ─────────────────────────────────────────────────────────────────────────
 
     canon  = cache["canon"]
     cfg    = SESSION[canon]
@@ -654,7 +628,6 @@ def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
     cache["utc_m"]  = np.append(cache["utc_m"],  utc_m_new)
     cache["dates"]  = np.append(cache["dates"],  date_new)
 
-    # ATR Wilder step
     prev_c   = cache["_prev_c"]
     prev_atr = cache["_atr_prev"]
     tr       = max(h - l, abs(h - prev_c), abs(l - prev_c))
@@ -664,7 +637,6 @@ def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
     cache["_atr_prev"] = new_atr
     cache["_prev_c"]   = c
 
-    # ATR pct rank
     hist  = cache["_atr_hist"]
     new_n = n + 1
     if new_n > WARMUP_M5 and len(hist) > 0:
@@ -674,7 +646,6 @@ def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
     bisect.insort(hist, new_atr)
     cache["atr_pct"] = np.append(cache["atr_pct"], new_pct)
 
-    # in_session
     in_sess_new = (
         (utc_h_new > cfg["open_h"] or
          (utc_h_new == cfg["open_h"] and utc_m_new >= cfg["open_m"]))
@@ -682,7 +653,6 @@ def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
     )
     cache["in_session"] = np.append(cache["in_session"], in_sess_new)
 
-    # OR update
     or_bars_n = OR_BARS[params["or_minutes"]]
 
     if utc_h_new == cfg["open_h"] and utc_m_new == cfg["open_m"]:
@@ -714,7 +684,6 @@ def append_bar_to_cache(cache: dict, bar_time: pd.Timestamp,
     cache["or_high"] = np.append(cache["or_high"], or_h_new)
     cache["or_low"]  = np.append(cache["or_low"],  or_l_new)
 
-    # Signal detection — identical logic to BT
     sig_new = np.int8(0)
 
     if (in_sess_new
@@ -773,6 +742,7 @@ def _last_closed_bar_open_time() -> datetime.datetime:
 def _fetch_broker_range(broker_sym: str,
                          from_dt: datetime.datetime,
                          to_dt:   datetime.datetime) -> pd.DataFrame:
+    _ping(f"fetch_broker_range:{broker_sym}")
     last_closed = _last_closed_bar_open_time()
     safe_to     = min(to_dt, last_closed)
     if safe_to < from_dt:
@@ -813,6 +783,7 @@ def load_history(canon: str, broker_sym: str):
 
     need = WARMUP_M5 + ATR_PERIOD + 500
     logger.info(f"[{canon}] No CSV — fetching {need} bars from broker")
+    _ping(f"load_history_broker:{canon}")
     rates = mt5.copy_rates_from_pos(broker_sym, mt5.TIMEFRAME_M5, 0, need + 2)
     if rates is None or len(rates) < WARMUP_M5 + ATR_PERIOD + 10:
         logger.error(f"[{canon}] broker fetch failed")
@@ -830,26 +801,13 @@ def load_history(canon: str, broker_sym: str):
 
 # ==============================================================================
 #  SECTION 7 — BAR FETCH
-#
-#  FIX-4: Explicit stale check added at timeout fallback path.
-#  The main polling loop already requires bt > last_cached_bar_time.
-#  The timeout fallback now also enforces this, and logs clearly when
-#  it rejects a stale bar vs when it accepts a late-arriving new bar.
 # ==============================================================================
 
 def _fetch_single_closed_bar(broker_sym: str,
                               last_cached_bar_time: pd.Timestamp) -> tuple:
-    """
-    Poll broker index 1 (last fully closed bar) until its open timestamp
-    is strictly greater than last_cached_bar_time, then return it.
-
-    FIX-4: Timeout fallback now also enforces bt > last_cached_bar_time.
-    Previously the timeout path only checked bt <= last_cached_bar_time and
-    returned None, but did not guard against equality edge cases introduced
-    by broker timestamp rounding.  Now the check is identical in both paths.
-    """
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
+        _ping(f"fetch_bar_poll:{broker_sym}")
         rates = mt5.copy_rates_from_pos(broker_sym, mt5.TIMEFRAME_M5, 1, 1)
         if rates is not None and len(rates) == 1:
             bt = pd.Timestamp(int(rates[0]["time"]), unit="s")
@@ -860,15 +818,14 @@ def _fetch_single_closed_bar(broker_sym: str,
                         float(r["low"]),  float(r["close"]))
         time.sleep(0.1)
 
-    # Timeout: final attempt — only accept if strictly newer than cache
+    _ping(f"fetch_bar_timeout:{broker_sym}")
     rates = mt5.copy_rates_from_pos(broker_sym, mt5.TIMEFRAME_M5, 1, 1)
     if rates is not None and len(rates) == 1:
         r  = rates[0]
         bt = pd.Timestamp(int(r["time"]), unit="s")
-        if bt <= last_cached_bar_time:          # FIX-4: strict guard
+        if bt <= last_cached_bar_time:
             logger.warning(f"[{broker_sym}] fetch timeout: broker at {bt}, "
-                           f"cache at {last_cached_bar_time} "
-                           f"— stale bar rejected")
+                           f"cache at {last_cached_bar_time} — stale bar rejected")
             return None
         logger.warning(f"[{broker_sym}] fetch timeout accepted bar {bt} "
                        f"(cache was at {last_cached_bar_time})")
@@ -886,6 +843,7 @@ def get_min_sl_distance(broker_sym: str) -> float:
     info     = _tick_info.get(broker_sym)
     point    = info["point"] if info else 0.0001
     fallback = 5.0 * point
+    _ping(f"symbol_info:{broker_sym}")
     sym_info = mt5.symbol_info(broker_sym)
     if sym_info is None:
         return fallback
@@ -949,6 +907,7 @@ def compute_lot(broker_sym: str, sl_dist: float, balance: float):
 
 def send_market_order(broker_sym: str, direction: str, lot: float,
                       sl_price: float, comment: str):
+    _ping(f"tick_for_order:{broker_sym}")
     tick = mt5.symbol_info_tick(broker_sym)
     if tick is None:
         logger.error(f"[{broker_sym}] tick unavailable")
@@ -971,6 +930,7 @@ def send_market_order(broker_sym: str, direction: str, lot: float,
         "comment":      comment,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
+    _ping(f"order_send_entry:{broker_sym}")
     result = mt5.order_send(req)
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
         logger.error(f"[{broker_sym}] Entry FAILED retcode="
@@ -986,26 +946,19 @@ def send_market_order(broker_sym: str, direction: str, lot: float,
 def modify_sl_with_retry(broker_sym: str, ticket: int,
                           new_sl: float, direction: str,
                           timeout: float = None) -> bool:
-    """
-    Retry SL modification on same bar until success.
-    Aborts only on: position gone, market disabled.
-    10016 and all other transient errors are retried without limit.
-    timeout param kept for call-site compatibility — not used.
-    """
     attempt = 0
     while True:
         attempt += 1
+        _ping(f"sl_retry_{attempt}:{broker_sym}:{ticket}")
 
         if not mt5.positions_get(ticket=ticket):
-            logger.warning(f"[{broker_sym}] SL retry {attempt}: "
-                           f"ticket={ticket} gone — aborting")
+            logger.warning(f"[{broker_sym}] SL retry {attempt}: ticket={ticket} gone")
             return False
 
         sym_info = mt5.symbol_info(broker_sym)
         if (sym_info is not None and
                 sym_info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED):
-            logger.error(f"[{broker_sym}] SL aborted: market disabled "
-                         f"ticket={ticket}")
+            logger.error(f"[{broker_sym}] SL aborted: market disabled ticket={ticket}")
             return False
 
         tick = mt5.symbol_info_tick(broker_sym)
@@ -1023,6 +976,7 @@ def modify_sl_with_retry(broker_sym: str, ticket: int,
             "sl":       sl_clamped,
             "tp":       0.0,
         }
+        _ping(f"order_send_sl:{broker_sym}:{ticket}")
         result  = mt5.order_send(req)
         retcode = getattr(result, "retcode", None)
 
@@ -1039,6 +993,7 @@ def modify_sl_with_retry(broker_sym: str, ticket: int,
 def send_close(broker_sym: str, position) -> bool:
     otype = (mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY
              else mt5.ORDER_TYPE_BUY)
+    _ping(f"tick_for_close:{broker_sym}")
     tick  = mt5.symbol_info_tick(broker_sym)
     price = tick.bid if position.type == mt5.ORDER_TYPE_BUY else tick.ask
     req = {
@@ -1053,14 +1008,13 @@ def send_close(broker_sym: str, position) -> bool:
         "comment":      "orb_exit",
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
+    _ping(f"order_send_close:{broker_sym}:{position.ticket}")
     result = mt5.order_send(req)
     ok = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
     if ok:
-        logger.info(f"[{broker_sym}] CLOSED ticket={position.ticket} "
-                    f"price={price:.5f}")
+        logger.info(f"[{broker_sym}] CLOSED ticket={position.ticket} price={price:.5f}")
     else:
-        logger.error(f"[{broker_sym}] Close FAILED "
-                     f"retcode={getattr(result,'retcode',None)}")
+        logger.error(f"[{broker_sym}] Close FAILED retcode={getattr(result,'retcode',None)}")
     return ok
 
 
@@ -1128,6 +1082,7 @@ def manage_positions(canon: str, broker_sym: str, sym_st: dict,
     cfg      = SESSION[canon]
     atr_cur  = float(cache["atr14"][i])
 
+    _ping(f"positions_get:{broker_sym}")
     broker_positions = mt5.positions_get(symbol=broker_sym) or []
     broker_positions = [p for p in broker_positions if p.magic == MAGIC]
     broker_map       = {p.ticket: p for p in broker_positions}
@@ -1147,17 +1102,13 @@ def manage_positions(canon: str, broker_sym: str, sym_st: dict,
         pr["hold_count"] += 1
         hc = pr["hold_count"]
 
-        # EOD exit
         if bar_date != pr["entry_date"] or bar_hour >= cfg["close_h"]:
-            logger.info(f"[{canon}] EOD exit ticket={pr['ticket']} "
-                        f"bar={bar_date} {bar_hour:02d}h "
-                        f"entry={pr['entry_date']}")
+            logger.info(f"[{canon}] EOD exit ticket={pr['ticket']}")
             if bp:
                 send_close(broker_sym, bp)
             sym_st["positions"].remove(pr)
             continue
 
-        # Max hold
         if hc >= MAX_HOLD:
             logger.info(f"[{canon}] MAX HOLD ticket={pr['ticket']}")
             if bp:
@@ -1165,7 +1116,6 @@ def manage_positions(canon: str, broker_sym: str, sym_st: dict,
             sym_st["positions"].remove(pr)
             continue
 
-        # Break-even at 1R
         one_r = ep + (sl_dist if direction == "long" else -sl_dist)
         if not pr["be_active"]:
             triggered = ((direction == "long"  and bar_h >= one_r) or
@@ -1173,10 +1123,8 @@ def manage_positions(canon: str, broker_sym: str, sym_st: dict,
             if triggered:
                 pr["be_active"]  = True
                 pr["current_sl"] = ep
-                logger.info(f"[{canon}] BE ticket={pr['ticket']} "
-                            f"SL -> {ep:.5f}")
+                logger.info(f"[{canon}] BE ticket={pr['ticket']} SL -> {ep:.5f}")
 
-        # Trail
         if pr["be_active"]:
             ta   = (atr_cur if (not np.isnan(atr_cur) and atr_cur > 0)
                     else (pr["entry_atr"] or sl_dist))
@@ -1186,14 +1134,12 @@ def manage_positions(canon: str, broker_sym: str, sym_st: dict,
             else:
                 pr["current_sl"] = min(pr["current_sl"], bar_l + mult * ta)
 
-        # SL modify with retry on same bar
         if bp is not None:
             broker_sl = bp.sl or 0.0
             new_sl    = pr["current_sl"]
             pip       = _tick_info.get(broker_sym, {}).get("pip", 0.0001)
             if abs(new_sl - broker_sl) >= pip:
-                modify_sl_with_retry(broker_sym, pr["ticket"],
-                                     new_sl, direction)
+                modify_sl_with_retry(broker_sym, pr["ticket"], new_sl, direction)
 
 
 # ==============================================================================
@@ -1203,6 +1149,7 @@ def manage_positions(canon: str, broker_sym: str, sym_st: dict,
 def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
                   today, direction: str, sl_dist: float, atr_val: float,
                   or_h: float, or_l: float) -> None:
+    _ping(f"account_info_entry:{canon}")
     acct = mt5.account_info()
     if acct is None:
         logger.error(f"[{canon}] account_info unavailable — entry cancelled")
@@ -1210,6 +1157,7 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
     balance     = acct.balance
     free_margin = acct.margin_free
 
+    _ping(f"tick_entry:{broker_sym}")
     tick = mt5.symbol_info_tick(broker_sym)
     if tick is None:
         logger.error(f"[{canon}] tick unavailable — entry cancelled")
@@ -1238,28 +1186,18 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
         return
 
     otype = mt5.ORDER_TYPE_BUY if direction == "long" else mt5.ORDER_TYPE_SELL
+    _ping(f"calc_margin:{broker_sym}")
     required_margin = mt5.order_calc_margin(otype, broker_sym, lot, ep)
 
     if required_margin is None:
-        logger.warning(f"[{canon}] order_calc_margin returned None "
-                       f"— proceeding without margin check")
+        logger.warning(f"[{canon}] order_calc_margin returned None — proceeding")
     else:
         required_with_buffer = required_margin * 1.10
         if free_margin < required_with_buffer:
-            logger.warning(
-                f"[{canon}] insufficient margin: "
-                f"free={free_margin:.2f} "
-                f"required={required_margin:.2f} "
-                f"(+10% buffer={required_with_buffer:.2f}) "
-                f"lot={lot} price={ep:.5f} — entry cancelled"
-            )
+            logger.warning(f"[{canon}] insufficient margin: "
+                           f"free={free_margin:.2f} req={required_margin:.2f} — cancelled")
             return
-        logger.info(
-            f"[{canon}] margin OK: "
-            f"free={free_margin:.2f} "
-            f"required={required_margin:.2f} "
-            f"(+10% buffer={required_with_buffer:.2f})"
-        )
+        logger.info(f"[{canon}] margin OK: free={free_margin:.2f} req={required_margin:.2f}")
 
     ticket, _ = send_market_order(broker_sym, direction, lot, sl_price,
                                   f"{COMMENT}_{canon}")
@@ -1269,6 +1207,7 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
     filled = []
     for _ in range(10):
         time.sleep(0.05)
+        _ping(f"confirm_fill:{broker_sym}:{ticket}")
         filled = [p for p in (mt5.positions_get(symbol=broker_sym) or [])
                   if p.magic == MAGIC and p.ticket == ticket]
         if filled:
@@ -1290,8 +1229,7 @@ def execute_entry(canon: str, broker_sym: str, sym_st: dict, params: dict,
     logger.info(f"[{canon}] ENTERED {direction.upper()} ticket={ticket} "
                 f"ep={actual_ep:.5f} sl={actual_sl:.5f} "
                 f"sl_dist={sl_dist:.5f} lot={lot} "
-                f"OR_HIGH={or_h:.5f} OR_LOW={or_l:.5f} "
-                f"balance={balance:.2f} free_margin={free_margin:.2f}")
+                f"OR_HIGH={or_h:.5f} OR_LOW={or_l:.5f}")
 
 
 # ==============================================================================
@@ -1309,9 +1247,7 @@ def process_bar(canon: str, broker_sym: str, sym_st: dict,
         return
     bar_time, o, h, l, c = bar
 
-    # append_bar_to_cache has its own stale guard (FIX-1) — belt and braces
     append_bar_to_cache(cache, bar_time, o, h, l, c)
-    # _append_csv has its own dupe guard (FIX-2)
     _append_csv(canon, bar_time, o, h, l, c)
 
     today = cache["dates"][-1]
@@ -1324,6 +1260,7 @@ def process_bar(canon: str, broker_sym: str, sym_st: dict,
     if sig == 0:
         return
 
+    _ping(f"signal_check_positions:{broker_sym}")
     broker_positions = [p for p in (mt5.positions_get(symbol=broker_sym) or [])
                         if p.magic == MAGIC]
     if len(broker_positions) >= params["max_trades_day"]:
@@ -1349,20 +1286,7 @@ def process_bar(canon: str, broker_sym: str, sym_st: dict,
 
 
 # ==============================================================================
-#  SECTION 15 — BAR CLOCK
-#
-#  FIX-3: wait_for_new_bar now tracks last_seen broker timestamp separately
-#  from last_bar_time.  During market closure the broker keeps returning the
-#  same stale bar (bt > last_bar_time because it's from the previous session,
-#  but it never advances).  Previously this caused the function to return
-#  immediately on every M5 boundary, generating a flood of spurious
-#  process_bar() calls that were only stopped by the 30s timeout inside
-#  _fetch_single_closed_bar().
-#
-#  Now: if the broker returns the same bar it already returned in a prior
-#  iteration (t == last_seen), the function backs off 10 s before retrying
-#  the boundary wait.  A genuine new bar (t > last_seen) is returned
-#  immediately as before.
+#  SECTION 15 — BAR CLOCK  (WD-3: heartbeat + last_seen fix)
 # ==============================================================================
 
 _CLOCK_BROKER = None
@@ -1377,26 +1301,38 @@ def _next_m5_boundary() -> datetime.datetime:
 
 
 def _broker_last_bar_time() -> pd.Timestamp:
+    """WD-4: log WARNING when MT5 returns None instead of silently ignoring."""
     if _CLOCK_BROKER is None:
         return None
+    _ping(f"clock_poll:{_CLOCK_BROKER}")
     rates = mt5.copy_rates_from_pos(_CLOCK_BROKER, mt5.TIMEFRAME_M5, 1, 1)
-    if rates is not None and len(rates) == 1:
-        return pd.Timestamp(int(rates[0]["time"]), unit="s")
-    return None
+    if rates is None or len(rates) == 0:
+        logger.warning(f"[clock] copy_rates_from_pos returned None "
+                       f"for {_CLOCK_BROKER} — MT5 frozen or disconnected?")
+        return None
+    return pd.Timestamp(int(rates[0]["time"]), unit="s")
 
 
 def wait_for_new_bar(last_bar_time: pd.Timestamp) -> pd.Timestamp:
     """
-    FIX-3: tracks last_seen to detect when broker stops advancing
-    (market closed / holiday).  Backs off 10 s when the same bar
-    keeps being returned, instead of hammering process_bar() with
-    stale data and relying solely on the 30 s timeout as a backstop.
+    WD-3 upgrades:
+      - Heartbeat INFO log at the top of every cycle (always visible).
+      - Inner poll timeout logs at INFO not DEBUG.
+      - last_seen updated before break to prevent stale-bar false positive.
     """
-    last_seen = last_bar_time   # broker timestamp seen in the previous iteration
+    last_seen = last_bar_time
+    cycle     = 0
 
     while True:
         boundary  = _next_m5_boundary()
         sleep_sec = (boundary - datetime.datetime.utcnow()).total_seconds() - 0.5
+        cycle    += 1
+
+        # WD-3: always-visible heartbeat — proves the engine is alive
+        logger.info(f"[clock] cycle={cycle} | last_bar={last_bar_time} | "
+                    f"sleeping {max(sleep_sec, 0):.0f}s to {boundary.strftime('%H:%M:%S')} UTC")
+
+        _ping(f"clock_sleep:cycle={cycle}")
         if sleep_sec > 0:
             time.sleep(sleep_sec)
 
@@ -1405,18 +1341,21 @@ def wait_for_new_bar(last_bar_time: pd.Timestamp) -> pd.Timestamp:
             t = _broker_last_bar_time()
             if t is not None and t > last_bar_time:
                 if t > last_seen:
-                    # Broker has genuinely advanced — new bar confirmed
+                    logger.info(f"[clock] new bar confirmed: {t}")
                     return t
-                # Broker returned the same bar it showed last iteration.
-                # Market is closed or frozen — back off to avoid spin.
-                logger.debug(f"[clock] broker stale at {t} "
-                             f"(same as last_seen) — backing off 10 s")
+                # WD-3: update last_seen before backing off so next cycle
+                # doesn't falsely pass the t > last_seen check on the same bar
+                last_seen = t
+                logger.info(f"[clock] broker frozen at {t} "
+                            f"(same as last_seen) — backing off 10s")
                 time.sleep(10)
-                break           # re-enter boundary wait
+                break
             time.sleep(0.1)
         else:
-            logger.debug(f"[clock] no new bar after "
-                         f"{boundary.strftime('%H:%M')} — retry")
+            # WD-3: changed from DEBUG to INFO so this is always visible
+            logger.info(f"[clock] no new bar after 90s poll "
+                        f"(last_bar={last_bar_time}, last_seen={last_seen}) "
+                        f"— retrying boundary wait")
 
 
 # ==============================================================================
@@ -1435,7 +1374,11 @@ def run_live():
 
     print("ORB V6 starting...", flush=True)
 
+    # Start watchdog immediately so it catches hangs during startup too
+    _start_watchdog()
+
     for attempt in range(30):
+        _ping(f"mt5_init_attempt:{attempt+1}")
         ok  = mt5.initialize()
         err = mt5.last_error()
         print(f"  MT5 init {attempt+1}/30: ok={ok} err={err}", flush=True)
@@ -1445,11 +1388,13 @@ def run_live():
     else:
         raise RuntimeError("MT5 did not respond after 90s")
 
+    _ping("mt5_login")
     auth = mt5.login(LOGIN, PASSWORD, SERVER)
     if not auth:
         mt5.shutdown()
         raise RuntimeError(f"Login failed: {mt5.last_error()}")
 
+    _ping("account_info_startup")
     acct = mt5.account_info()
     logger.info(f"MT5 connected | account={acct.login} | "
                 f"balance={acct.balance:.2f} | currency={acct.currency}")
@@ -1461,6 +1406,7 @@ def run_live():
 
     for canon in active:
         broker = sym_map[canon]
+        _ping(f"symbol_info_startup:{broker}")
         info   = mt5.symbol_info(broker)
         if info is None:
             continue
@@ -1476,23 +1422,22 @@ def run_live():
             "point":    info.point if info.point > 0 else pip,
         }
         logger.info(f"  {canon} ({broker}): digits={info.digits} "
-                    f"tvpl={tvpl:.6f} vol_min={info.volume_min} "
-                    f"stops_level={info.trade_stops_level} "
-                    f"params={BEST_PARAMS[canon]}")
+                    f"tvpl={tvpl:.6f} params={BEST_PARAMS[canon]}")
 
     _MAX_TRADES_DAY_COMBO = sum(BEST_PARAMS[s]["max_trades_day"] for s in active)
 
-    # ── Build caches ──────────────────────────────────────────────────────────
     logger.info("=== BUILDING CACHES ===")
     caches   = {}
     hist_dfs = {}
     for canon in list(active):
         broker = sym_map[canon]
+        _ping(f"load_history:{canon}")
         df = load_history(canon, broker)
         if df is None or len(df) < WARMUP_M5 + ATR_PERIOD + 10:
             logger.error(f"[{canon}] not enough history — skipping")
             active.remove(canon)
             continue
+        _ping(f"build_cache:{canon}")
         cache = build_cache(canon, df, BEST_PARAMS[canon])
         cache["_atr_hist"] = _rebuild_atr_hist(cache["atr14"])
         caches[canon]   = cache
@@ -1503,9 +1448,9 @@ def run_live():
         mt5.shutdown()
         return
 
-    # ── BT accuracy check ─────────────────────────────────────────────────────
     logger.info("=== BT ACCURACY VERIFICATION ===")
     for canon in list(active):
+        _ping(f"verify_bt:{canon}")
         ok = verify_cache_vs_bt(
             canon, hist_dfs[canon], caches[canon], BEST_PARAMS[canon]
         )
@@ -1522,10 +1467,10 @@ def run_live():
     _CLOCK_BROKER = sym_map[active[0]]
     sym_states    = {c: make_sym_state() for c in active}
 
-    # ── Startup recovery ──────────────────────────────────────────────────────
     logger.info("=== STARTUP RECOVERY ===")
     for canon in active:
         broker    = sym_map[canon]
+        _ping(f"recovery_positions:{canon}")
         positions = [p for p in (mt5.positions_get(symbol=broker) or [])
                      if p.magic == MAGIC]
         for pos in positions:
@@ -1536,22 +1481,21 @@ def run_live():
                     sym_states[canon]["day_trades_count"] + 1,
                     BEST_PARAMS[canon]["max_trades_day"]
                 )
-        logger.info(f"  {canon}: recovered "
-                    f"{len(sym_states[canon]['positions'])} pos")
+        logger.info(f"  {canon}: recovered {len(sym_states[canon]['positions'])} pos")
     logger.info("=== END RECOVERY ===")
 
-    cache_last_times = [pd.Timestamp(int(caches[c]["times"][-1]))
-                        for c in active]
+    cache_last_times = [pd.Timestamp(int(caches[c]["times"][-1])) for c in active]
     last_bar_time    = min(cache_last_times)
-    logger.info(f"Seeded from cache: {last_bar_time} — "
-                f"waiting for next M5 close...")
+    logger.info(f"Seeded from cache: {last_bar_time} — waiting for next M5 close...")
 
     bar_count = 0
     while True:
         try:
+            _ping("wait_for_new_bar")
             new_bar_time  = wait_for_new_bar(last_bar_time)
             last_bar_time = new_bar_time
             bar_count    += 1
+            _ping(f"bar_{bar_count}_start")
 
             logger.info(f"-- BAR {bar_count} | {new_bar_time} "
                         f"------------------------------")
@@ -1562,6 +1506,7 @@ def run_live():
                     args=(canon, sym_map[canon], sym_states[canon],
                           caches[canon], BEST_PARAMS[canon], new_bar_time),
                     daemon=True,
+                    name=f"bar_{bar_count}_{canon}",
                 )
                 for canon in active
             ]
@@ -1569,6 +1514,11 @@ def run_live():
                 t.start()
             for t in threads:
                 t.join(timeout=25)
+                if t.is_alive():
+                    logger.error(f"[WARN] thread {t.name} still alive after 25s "
+                                 f"— possible hang in order_send or SL retry")
+
+            _ping(f"bar_{bar_count}_done")
 
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt — shutting down ORB V6")
