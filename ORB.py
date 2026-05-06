@@ -41,7 +41,13 @@ except ImportError:
 # ── Logging ───────────────────────────────────────────────────────────────────
 logger = logging.getLogger("ORB_V6")
 logger.setLevel(logging.INFO)
-_fh = RotatingFileHandler(
+class _FlushingRotatingFileHandler(RotatingFileHandler):
+    """Flush after every emit so Notepad always shows the latest lines."""
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+_fh = _FlushingRotatingFileHandler(
     "orb_live_v6.log", maxBytes=15_000_000, backupCount=5, encoding="utf-8"
 )
 _fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
@@ -1449,14 +1455,17 @@ def run_live():
         return
 
     logger.info("=== BT ACCURACY VERIFICATION ===")
-    for canon in list(active):
+    failed_bt = []
+    for canon in list(active):   # iterate snapshot so removals don't skip symbols
         _ping(f"verify_bt:{canon}")
         ok = verify_cache_vs_bt(
             canon, hist_dfs[canon], caches[canon], BEST_PARAMS[canon]
         )
         if not ok:
             logger.error(f"[{canon}] failed BT accuracy check — removing")
-            active.remove(canon)
+            failed_bt.append(canon)
+    for canon in failed_bt:      # mutate only after loop is complete
+        active.remove(canon)
     logger.info("=== END BT ACCURACY VERIFICATION ===")
 
     if not active:
