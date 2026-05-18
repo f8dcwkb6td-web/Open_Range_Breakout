@@ -61,7 +61,7 @@ logger.addHandler(_sh)
 # ── MT5 connection ────────────────────────────────────────────────────────────
 TERMINAL_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 LOGIN         = 1513418720
-PASSWORD      = "yI2g*C1!R8@y4"
+PASSWORD      = "Menxce@411"
 SERVER        = "FTMO-Demo"
 
 # ── Engine identity ───────────────────────────────────────────────────────────
