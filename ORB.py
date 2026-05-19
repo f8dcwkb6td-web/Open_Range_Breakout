@@ -534,6 +534,20 @@ def _rebuild_atr_hist(atr14: np.ndarray) -> list:
     return hist
 
 
+def _log_last_bar(canon: str, cache: dict) -> None:
+    i  = cache["n"] - 1
+    ts = pd.Timestamp(int(cache["times"][i]))
+    o  = float(cache["o"][i])
+    h  = float(cache["h"][i])
+    l  = float(cache["l"][i])
+    c  = float(cache["c"][i])
+    logger.info(
+        f"[{canon}] last cached bar — "
+        f"open={ts} (closes at {ts + pd.Timedelta(minutes=5)}) | "
+        f"O={o:.5f}  H={h:.5f}  L={l:.5f}  C={c:.5f}"
+    )
+
+
 # ==============================================================================
 #  SECTION 4B — BT ACCURACY VERIFICATION
 # ==============================================================================
@@ -1255,6 +1269,7 @@ def process_bar(canon: str, broker_sym: str, sym_st: dict,
 
     append_bar_to_cache(cache, bar_time, o, h, l, c)
     _append_csv(canon, bar_time, o, h, l, c)
+    _log_last_bar(canon, cache)
 
     today = cache["dates"][-1]
     _reset_daily(sym_st, today)
@@ -1446,6 +1461,7 @@ def run_live():
         _ping(f"build_cache:{canon}")
         cache = build_cache(canon, df, BEST_PARAMS[canon])
         cache["_atr_hist"] = _rebuild_atr_hist(cache["atr14"])
+        _log_last_bar(canon, cache)
         caches[canon]   = cache
         hist_dfs[canon] = df
     logger.info("=== END CACHES ===")
