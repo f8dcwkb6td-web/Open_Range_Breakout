@@ -1509,9 +1509,15 @@ def run_live():
         logger.info(f"  {canon}: recovered {len(sym_states[canon]['positions'])} pos")
     logger.info("=== END RECOVERY ===")
 
-    cache_last_times = [pd.Timestamp(int(caches[c]["times"][-1])) for c in active]
-    last_bar_time    = min(cache_last_times)
-    logger.info(f"Seeded from cache: {last_bar_time} — waiting for next M5 close...")
+    _ping("seed_last_bar_time")
+    _seed_rates = mt5.copy_rates_from_pos(_CLOCK_BROKER, mt5.TIMEFRAME_M5, 1, 1)
+    if _seed_rates is not None and len(_seed_rates) == 1:
+        last_bar_time = pd.Timestamp(int(_seed_rates[0]["time"]), unit="s")
+        logger.info(f"Seeded from MT5: {last_bar_time} — waiting for next M5 close...")
+    else:
+        cache_last_times = [pd.Timestamp(int(caches[c]["times"][-1])) for c in active]
+        last_bar_time    = min(cache_last_times)
+        logger.info(f"Seeded from cache (MT5 unavailable): {last_bar_time} — waiting for next M5 close...")
 
     bar_count = 0
     while True:
